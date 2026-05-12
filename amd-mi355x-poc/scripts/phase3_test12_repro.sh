@@ -10,7 +10,7 @@
 set -e
 
 PREFILL_NODE=smci355-ccs-aus-g12-06
-DECODE_NODE=smci355-ccs-aus-g12-26
+DECODE_NODE=smci355-ccs-aus-g12-22   # new decode (was g12-26 — that holder expired)
 PREFILL_IP=10.194.30.23
 IMAGE=docker.io/rocm/sgl-dev:v0.5.10.post1-rocm720-mi35x-20260503
 HF_CACHE=/shared/amdgpu/home/anluo/.cache/huggingface
@@ -105,6 +105,7 @@ if [[ "$ROLE" == "prefill" ]]; then
         --disable-radix-cache \
         --max-running-requests 128 \
         --chunked-prefill-size 262144 \
+        --cuda-graph-bs $(seq -s ' ' 1 128) \
         $BASE_FLAGS \
         > /tmp/worker.log 2>&1 &
     W_PID=$!
@@ -120,6 +121,7 @@ elif [[ "$ROLE" == "decode" ]]; then
         --prefill-round-robin-balance \
         --max-running-requests 128 \
         --chunked-prefill-size 262144 \
+        --cuda-graph-bs $(seq -s ' ' 1 128) \
         $BASE_FLAGS \
         > /tmp/worker.log 2>&1 &
     W_PID=$!
