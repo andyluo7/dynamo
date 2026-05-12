@@ -11,18 +11,27 @@ lives under this `amd-mi355x-poc/` subdirectory and is applied at runtime by
 the launch scripts. The objective was to identify the **minimum** set of
 changes upstream `ai-dynamo/dynamo:main` would need to support AMD MI355X.
 
-## Results — all 4 milestones PASS
+## Results — all milestones PASS (incl. production-scale escalations)
 
 Cluster: AAC1 (`aac1.amd.com`), partition `256C8G1H_MI355X_Ubuntu22`.
-Hardware: 2× 8-GPU MI355X nodes (`smci355-ccs-aus-g12-{22,26}`), each with
-9× AMD Pensando ionic RoCE NICs.
+Hardware: 2× 8-GPU MI355X nodes, each with 9× AMD Pensando ionic RoCE NICs.
 
-| Phase | Backend | Mode | Model | Result | c=8 tok/s |
-|---|---|---|---|---|---|
-| 1 | SGLang | single-node agg, TP=8 | DeepSeek-R1-0528 FP8 (671B) | ✅ | 708 |
-| 2 / 2.5 | vLLM | single-node agg, TP=4, HIP graphs | MiniMax-M2.5 FP8 (229B MoE) | ✅ | 521 |
-| 3 | SGLang | 2-node disagg + Mooncake | Qwen3-0.6B | ✅ | 122 |
-| 4 | vLLM | 2-node disagg + RIXL/UCX | Qwen3-0.6B | ✅ | 646 |
+| Phase | Backend | Mode | Model | Result | c=8 tok/s | Success @ c=8 |
+|---|---|---|---|---|---|---|
+| 1 | SGLang | single-node agg, TP=8 | DeepSeek-R1-0528 FP8 (671B) | ✅ | 708 | 24/24 |
+| 2 / 2.5 | vLLM | single-node agg, TP=4, HIP graphs | MiniMax-M2.5 FP8 (229B MoE) | ✅ | 521 | 24/24 |
+| 3 (Qwen) | SGLang | 2-node disagg + Mooncake, TP=1 | Qwen3-0.6B | ✅ | 122 | 24/24 |
+| **3 (DSR1)** | SGLang | **2-node disagg + Mooncake, TP=8** | **DeepSeek-R1-0528 FP8 (671B)** | **✅** | **32.8** | **24/24** |
+| 4 (Qwen) | vLLM | 2-node disagg + RIXL/UCX, TP=1 | Qwen3-0.6B | ✅ | 646 | 24/24 |
+| **4 (M2.5)** | vLLM | **2-node disagg + RIXL/UCX, TP=4** | **MiniMaxAI/MiniMax-M2.5 (229B MoE)** | **✅** | **72.7** | **24/24** |
+
+Production-scale escalation rows (bold) — see [`docs/08-phase34-escalation-results.md`](docs/08-phase34-escalation-results.md). Both the 671B DeepSeek-R1 SGLang disagg and 229B MiniMax-M2.5 vLLM disagg paths run end-to-end across two MI355X nodes with KV transfer over Pensando ionic RoCE.
+
+Disagg latency observations on the production-scale models:
+- **DSR1 disagg ~22× slower than agg** (Mooncake chunked-MR DRAM-staging overhead per token; ionic doesn't do GPUDirect RDMA so every transfer hits 2× hipMemcpy)
+- **M2.5 disagg ~7× slower than agg** (RIXL handles VRAM→DRAM fallback more efficiently than Mooncake on this hardware)
+
+Production perf optimization (e.g. dropping `--enforce-eager`, building MoRI for SGLang disagg per fork's runbook ≈5× faster than Mooncake on ionic) is a separate workstream — both should significantly close the agg-vs-disagg gap.
 
 Headline: **single-node aggregated Dynamo on AMD requires essentially zero
 patches** to upstream `dynamo` source. Disaggregated serving needs ~150 LoC
