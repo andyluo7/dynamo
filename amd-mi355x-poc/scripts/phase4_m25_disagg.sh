@@ -4,7 +4,7 @@
 set -e
 
 PREFILL_NODE=smci355-ccs-aus-g12-06
-DECODE_NODE=smci355-ccs-aus-g12-26
+DECODE_NODE=smci355-ccs-aus-g12-30   # g12-14 was shared with another user; g12-30 is exclusive
 PREFILL_IP=10.194.30.23
 IMAGE=localhost/dynamo-vllm-rixl:latest
 HF_CACHE=/shared/amdgpu/home/anluo/inferencex-agentic-test/hf-cache  # has M2.5
