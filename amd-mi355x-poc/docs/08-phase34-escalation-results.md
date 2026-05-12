@@ -13,6 +13,8 @@ After the original 4 PoC phases passed on small models (Qwen3-0.6B for both disa
 
 Stack identical to original Phase 3 (Qwen3-0.6B), bumped to TP=8 per node and DSR1 model. All 16 MI355X GPUs in active use simultaneously.
 
+**Mode**: HIP graphs **ENABLED** (no `--enforce-eager`, no `--disable-cuda-graph`). Worker.log confirmed `capture cuda graph end. Time elapsed: 90.12 s` on each TP worker, adding 90 s to startup but giving production-representative decode latency.
+
 ### Numbers
 
 | conc | N  | P50 (ms) | P95 (ms) | tok/s | output avg | success |
@@ -62,6 +64,8 @@ Our 32.8 tok/s @ c=8 = ~4 tok/s/GPU; fork's DEP8 hits 1,334 tok/s/GPU. **The ~33
 ## Phase 4 escalation: MiniMax-M2.5 vLLM 1P1D disagg
 
 Stack identical to original Phase 4 (Qwen3-0.6B), with TP=4 per node and M2.5 model. Uses 4 of 8 GPUs per node (HIP_VISIBLE_DEVICES=0,1,2,3).
+
+**Mode**: **EAGER** (`--enforce-eager` set on both prefill and decode). HIP-graph capture was skipped to avoid the ~2 min capture penalty during this PoC iteration. **The 72.7 tok/s @ c=8 number below is therefore an eager-mode floor, not a production number.** Per Phase 2.5 (vLLM agg, same model, same hardware), enabling HIP graphs gave a 6.6× decode speedup (66 ms → 10 ms ITL) — a similar uplift here would put M2.5 vLLM disagg in the ~400-500 tok/s @ c=8 range.
 
 ### Numbers
 
@@ -137,11 +141,13 @@ This PoC's escalation numbers (DSR1: 32.8 tok/s @ c=8 = 2.1 tok/s/GPU on 16 GPUs
 
 ### Tier 1 — Drop-in perf wins (~5-10× expected)
 
-| # | Item | Where in the fork | Effort | Expected impact |
-|---|---|---|---|---|
-| 1 | **Drop `--enforce-eager`** for SGLang/vLLM workers | n/a (just remove the flag) | trivial | 3-7× decode throughput per Phase 2.5 (vLLM agg), proven that gfx950 HIP-graph capture does NOT segfault for the configs we care about |
-| 2 | **Run a real concurrency sweep** at production scales (c=128, c=256, c=1024) | `scripts/run_benchmark.sh` + `InferenceX/utils/bench_serving/benchmark_serving.py` | small | The fork's high tok/s numbers are at c=128+; small-c numbers like ours don't amortize Mooncake's per-transfer overhead |
-| 3 | **Set the InferenceX 17 MoRI env vars** (even with Mooncake; some are generic) | `InferenceX/.../env.sh` | trivial | `MORI_IO_QP_MAX_SEND_WR=16384`, `MORI_IO_QP_MAX_CQE=32768`, `MC_MAX_SGE=2`, `SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=1200`, etc. |
+> **What we already had on:** the **DSR1 SGLang disagg** run was already with **HIP graphs enabled** (no `--enforce-eager`, no `--disable-cuda-graph`; worker.log confirmed `"capture cuda graph end. Time elapsed: 90.12 s"` on each TP worker). So Tier 1 item #1 below applies only to the **M2.5 vLLM disagg** path, where we did set `--enforce-eager`. Item #1 is the cheapest win we left on the table for the M2.5 number; it doesn't move the DSR1 number.
+
+| # | Item | Applies to | Where in the fork | Effort | Expected impact |
+|---|---|---|---|---|---|
+| 1 | **Drop `--enforce-eager`** for vLLM workers | M2.5 path (DSR1 SGLang already had HIP graphs on) | n/a (just remove the flag) | trivial | 3-7× decode throughput per Phase 2 → Phase 2.5 (vLLM agg, 66 ms → 10 ms ITL); proven that gfx950 HIP-graph capture does NOT segfault for these MoE configs |
+| 2 | **Run a real concurrency sweep** at production scales (c=128, c=256, c=1024) | both | `scripts/run_benchmark.sh` + `InferenceX/utils/bench_serving/benchmark_serving.py` | small | The fork's high tok/s numbers are at c=128+; small-c numbers like ours don't amortize per-transfer overhead. Our DSR1 c=8 measurement is structurally bandwidth-bottlenecked at low concurrency |
+| 3 | **Set the InferenceX 17 MoRI env vars** (even with Mooncake; some are generic) | both | `InferenceX/.../env.sh` | trivial | `MORI_IO_QP_MAX_SEND_WR=16384`, `MORI_IO_QP_MAX_CQE=32768`, `MC_MAX_SGE=2`, `SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=1200`, etc. |
 
 ### Tier 2 — Switch transport from Mooncake to MoRI (~5× per fork's runbook)
 
