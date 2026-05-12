@@ -1,0 +1,63 @@
+# Phase 4 PoC image: rocm/vllm-dev:nightly + UCX-ROCm + RIXL (real NIXL on AMD).
+# Build context must contain RIXL/ checked out from https://github.com/ROCm/RIXL.git
+# Build time: ~20-30 min on a fast NVMe + 64-core CPU.
+
+FROM docker.io/rocm/vllm-dev:nightly
+
+ARG UCX_BRANCH=v1.19.x
+WORKDIR /tmp
+ENTRYPOINT []
+CMD ["bash"]
+
+# Build deps for UCX + RIXL, plus rdma-core/ibverbs-providers for runtime ionic discovery + iproute2
+RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends \
+        build-essential autoconf automake libtool pkg-config cmake \
+        libclang-dev wget git ninja-build iproute2 \
+        libnuma-dev libibverbs-dev librdmacm-dev libcxxopts-dev rdma-core ibverbs-providers \
+        libaio-dev liburing-dev libgrpc-dev libgrpc++-dev libprotobuf-dev \
+        protobuf-compiler-grpc libcpprest-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# meson + meson-python + pybind11 (system pip, --break-system-packages allowed in container)
+RUN pip install --quiet --break-system-packages "meson>=1.4.0" "meson-python" "pybind11[global]" ninja patchelf
+
+# UCX with ROCm support (~5-10 min build)
+RUN cd /tmp && git clone --depth 1 https://github.com/ROCm/ucx -b ${UCX_BRANCH} && \
+    cd ucx && ./autogen.sh && mkdir build && cd build && \
+    ../configure --enable-shared --disable-static --disable-doxygen-doc \
+        --enable-optimizations --enable-devel-headers \
+        --with-rocm=/opt/rocm --with-verbs --with-dm --enable-mt \
+        --prefix=/usr/local/ucx --quiet && \
+    make -j$(nproc) --quiet && make install --quiet && \
+    rm -rf /tmp/ucx
+
+# RIXL (build from source via meson)
+COPY RIXL /tmp/rixl-src
+RUN cd /tmp/rixl-src && \
+    PKG_CONFIG_PATH=/usr/local/ucx/lib/pkgconfig \
+    meson setup build --prefix=/opt/rocm/rixl \
+        -Ducx_path=/usr/local/ucx \
+        -Drocm_path=/opt/rocm \
+        -Duse_rocm=true \
+        -Ddisable_gds_backend=true && \
+    ninja -C build -j$(nproc) && \
+    ninja -C build install
+
+# Python bindings (`pip install .` from RIXL root) — installs as `nixl` package
+RUN cd /tmp/rixl-src && \
+    PKG_CONFIG_PATH=/usr/local/ucx/lib/pkgconfig:/opt/rocm/rixl/lib/x86_64-linux-gnu/pkgconfig \
+    NIXL_PREFIX=/opt/rocm/rixl \
+    pip install --no-build-isolation --quiet --break-system-packages . && \
+    rm -rf /tmp/rixl-src
+
+ENV LD_LIBRARY_PATH="/opt/rocm/rixl/lib/x86_64-linux-gnu:/usr/local/ucx/lib:${LD_LIBRARY_PATH}"
+ENV NIXL_PREFIX=/opt/rocm/rixl
+
+# nixl → rixl Python shim (per fork's pattern: dynamo.nixl_connect imports `nixl._api`,
+# but ROCm port installs as `rixl`).
+RUN SITE=$(python3 -c "import site; print(site.getsitepackages()[0])") && \
+    mkdir -p $SITE/nixl && \
+    echo "from rixl import *" > $SITE/nixl/__init__.py && \
+    echo "from rixl._api import *" > $SITE/nixl/_api.py && \
+    echo "from rixl._bindings import *" > $SITE/nixl/_bindings.py && \
+    python3 -c "import nixl, nixl._api, nixl._bindings; print('nixl shim OK')"
