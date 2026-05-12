@@ -21,11 +21,14 @@ Hardware: 2× 8-GPU MI355X nodes, each with 9× AMD Pensando ionic RoCE NICs.
 | 1 | SGLang | single-node agg, TP=8 | DeepSeek-R1-0528 FP8 (671B) | ✅ | 708 | 24/24 |
 | 2 / 2.5 | vLLM | single-node agg, TP=4, HIP graphs | MiniMax-M2.5 FP8 (229B MoE) | ✅ | 521 | 24/24 |
 | 3 (Qwen) | SGLang | 2-node disagg + Mooncake, TP=1 | Qwen3-0.6B | ✅ | 122 | 24/24 |
-| **3 (DSR1)** | SGLang | **2-node disagg + Mooncake, TP=8 + HIP graphs** | **DeepSeek-R1-0528 FP8 (671B)** | **✅** | **32.8** | **24/24** |
+| 3 (DSR1, conservative) | SGLang | 2-node disagg + Mooncake, TP=8 + HIP graphs | DeepSeek-R1-0528 FP8 (671B) | ✅ | 32.8 | 24/24 |
+| **3 (DSR1, fork-aligned)** | **SGLang** | **2-node disagg + Mooncake, TP=8 + fork's launch + env (Test 12 repro)** | **DeepSeek-R1-0528 FP8 (671B)** | **✅** | **104.7 tok/s/req** ² | **10/10** |
 | 4 (Qwen) | vLLM | 2-node disagg + RIXL/UCX, TP=1, eager | Qwen3-0.6B | ✅ | 646 | 24/24 |
 | **4 (M2.5)** | vLLM | **2-node disagg + RIXL/UCX, TP=4 + HIP graphs** | **MiniMaxAI/MiniMax-M2.5 (229B MoE)** | **✅** | **587.1** ¹ | **24/24** |
 
 ¹ Initial M2.5 disagg run with `--enforce-eager` measured 72.7 tok/s @ c=8; re-running with HIP graphs enabled gave **8.1× speedup** to 587 tok/s. Notably **587 > 521 (Phase 2.5 single-node agg)** — disagg has 2 nodes' compute (8 GPUs vs 4) and the Dynamo frontend + KV-router overhead does not exceed the doubled compute.
+
+² Initial DSR1 disagg measurement was 32.8 tok/s aggregate @ c=8 with a conservative launch config. After applying the fork's exact launch flags (`--kv-cache-dtype fp8_e4m3 --attention-backend aiter` etc. from `scripts/benchmark/models.yaml` DSR1 entry) + 17 env vars from `env.sh` + a streaming bench harness with ISL=1024 OSL=1024 (matching `bench.sh`), per-request output throughput rose to **104.7 tok/s — 7% above the JohnQinAMD fork's published Test 12 result of 97.7 tok/s on the same Mooncake transport**. See [`docs/09-test12-reproduction.md`](docs/09-test12-reproduction.md). The ~6× speedup over the conservative measurement was tuning, not architecture.
 
 Production-scale escalation rows (bold) — see [`docs/08-phase34-escalation-results.md`](docs/08-phase34-escalation-results.md). Both the 671B DeepSeek-R1 SGLang disagg and 229B MiniMax-M2.5 vLLM disagg paths run end-to-end across two MI355X nodes with KV transfer over Pensando ionic RoCE.
 
