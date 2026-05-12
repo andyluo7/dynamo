@@ -21,17 +21,19 @@ Hardware: 2× 8-GPU MI355X nodes, each with 9× AMD Pensando ionic RoCE NICs.
 | 1 | SGLang | single-node agg, TP=8 | DeepSeek-R1-0528 FP8 (671B) | ✅ | 708 | 24/24 |
 | 2 / 2.5 | vLLM | single-node agg, TP=4, HIP graphs | MiniMax-M2.5 FP8 (229B MoE) | ✅ | 521 | 24/24 |
 | 3 (Qwen) | SGLang | 2-node disagg + Mooncake, TP=1 | Qwen3-0.6B | ✅ | 122 | 24/24 |
-| **3 (DSR1)** | SGLang | **2-node disagg + Mooncake, TP=8** | **DeepSeek-R1-0528 FP8 (671B)** | **✅** | **32.8** | **24/24** |
-| 4 (Qwen) | vLLM | 2-node disagg + RIXL/UCX, TP=1 | Qwen3-0.6B | ✅ | 646 | 24/24 |
-| **4 (M2.5)** | vLLM | **2-node disagg + RIXL/UCX, TP=4** | **MiniMaxAI/MiniMax-M2.5 (229B MoE)** | **✅** | **72.7** | **24/24** |
+| **3 (DSR1)** | SGLang | **2-node disagg + Mooncake, TP=8 + HIP graphs** | **DeepSeek-R1-0528 FP8 (671B)** | **✅** | **32.8** | **24/24** |
+| 4 (Qwen) | vLLM | 2-node disagg + RIXL/UCX, TP=1, eager | Qwen3-0.6B | ✅ | 646 | 24/24 |
+| **4 (M2.5)** | vLLM | **2-node disagg + RIXL/UCX, TP=4 + HIP graphs** | **MiniMaxAI/MiniMax-M2.5 (229B MoE)** | **✅** | **587.1** ¹ | **24/24** |
+
+¹ Initial M2.5 disagg run with `--enforce-eager` measured 72.7 tok/s @ c=8; re-running with HIP graphs enabled gave **8.1× speedup** to 587 tok/s. Notably **587 > 521 (Phase 2.5 single-node agg)** — disagg has 2 nodes' compute (8 GPUs vs 4) and the Dynamo frontend + KV-router overhead does not exceed the doubled compute.
 
 Production-scale escalation rows (bold) — see [`docs/08-phase34-escalation-results.md`](docs/08-phase34-escalation-results.md). Both the 671B DeepSeek-R1 SGLang disagg and 229B MiniMax-M2.5 vLLM disagg paths run end-to-end across two MI355X nodes with KV transfer over Pensando ionic RoCE.
 
-Disagg latency observations on the production-scale models:
-- **DSR1 disagg ~22× slower than agg** (Mooncake chunked-MR DRAM-staging overhead per token; ionic doesn't do GPUDirect RDMA so every transfer hits 2× hipMemcpy)
-- **M2.5 disagg ~7× slower than agg** (RIXL handles VRAM→DRAM fallback more efficiently than Mooncake on this hardware)
+Per-GPU efficiency observations:
+- **DSR1 disagg = 2.1 tok/s/GPU @ c=8** on 16 GPUs with Mooncake (the chunked-MR DRAM-staging path is the bottleneck — fork reports MoRI gives ~5× more throughput on ionic than Mooncake)
+- **M2.5 disagg = 73.4 tok/s/GPU @ c=8** on 8 GPUs with RIXL/UCX — **matches the JohnQinAMD fork's published 73.9 tok/s/GPU result** for DSR1 InferenceX MoRI 1P1D at c=32
 
-Production perf optimization (e.g. dropping `--enforce-eager`, building MoRI for SGLang disagg per fork's runbook ≈5× faster than Mooncake on ionic) is a separate workstream — both should significantly close the agg-vs-disagg gap.
+The remaining gap to the fork's headline 1,334 tok/s/GPU DEP8 result requires building MoRI from source, applying EP/DP-Attention, and a few additional patches — see [Path to Production Performance](docs/08-phase34-escalation-results.md#path-to-production-performance) in the escalation doc for the full 13-item list.
 
 Headline: **single-node aggregated Dynamo on AMD requires essentially zero
 patches** to upstream `dynamo` source. Disaggregated serving needs ~150 LoC

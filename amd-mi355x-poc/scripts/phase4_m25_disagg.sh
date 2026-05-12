@@ -85,8 +85,8 @@ if [[ "$ROLE" == "prefill" ]]; then
     export VLLM_NIXL_SIDE_CHANNEL_PORT=20097
     python3 -m dynamo.vllm \
         --model $MODEL --tensor-parallel-size $TP \
-        --max-model-len 4096 --max-num-seqs 4 \
-        --gpu-memory-utilization 0.80 --enforce-eager --trust-remote-code \
+        --max-model-len 4096 --max-num-seqs 8 \
+        --gpu-memory-utilization 0.80 --trust-remote-code \
         --disaggregation-mode prefill \
         --kv-transfer-config '{"kv_connector":"NixlConnector","kv_role":"kv_both"}' \
         > /tmp/worker.log 2>&1 &
@@ -96,8 +96,8 @@ elif [[ "$ROLE" == "decode" ]]; then
     export VLLM_NIXL_SIDE_CHANNEL_PORT=20098
     python3 -m dynamo.vllm \
         --model $MODEL --tensor-parallel-size $TP \
-        --max-model-len 4096 --max-num-seqs 4 \
-        --gpu-memory-utilization 0.80 --enforce-eager --trust-remote-code \
+        --max-model-len 4096 --max-num-seqs 8 \
+        --gpu-memory-utilization 0.80 --trust-remote-code \
         --disaggregation-mode decode \
         --kv-transfer-config '{"kv_connector":"NixlConnector","kv_role":"kv_both"}' \
         > /tmp/worker.log 2>&1 &

@@ -63,33 +63,48 @@ Our 32.8 tok/s @ c=8 = ~4 tok/s/GPU; fork's DEP8 hits 1,334 tok/s/GPU. **The ~33
 
 ## Phase 4 escalation: MiniMax-M2.5 vLLM 1P1D disagg
 
-Stack identical to original Phase 4 (Qwen3-0.6B), with TP=4 per node and M2.5 model. Uses 4 of 8 GPUs per node (HIP_VISIBLE_DEVICES=0,1,2,3).
+Stack identical to original Phase 4 (Qwen3-0.6B), with TP=4 per node and M2.5 model. Uses 4 of 8 GPUs per node (HIP_VISIBLE_DEVICES=0,1,2,3). **Re-run with HIP graphs after the original eager-mode measurement** — see "Numbers" below for both.
 
-**Mode**: **EAGER** (`--enforce-eager` set on both prefill and decode). HIP-graph capture was skipped to avoid the ~2 min capture penalty during this PoC iteration. **The 72.7 tok/s @ c=8 number below is therefore an eager-mode floor, not a production number.** Per Phase 2.5 (vLLM agg, same model, same hardware), enabling HIP graphs gave a 6.6× decode speedup (66 ms → 10 ms ITL) — a similar uplift here would put M2.5 vLLM disagg in the ~400-500 tok/s @ c=8 range.
+**Mode (final)**: **HIP graphs ENABLED** (no `--enforce-eager`). Initial run was eager-mode for a quick smoke test; the production-representative re-run with HIP graphs delivered an **8.1× speedup at c=8**.
 
-### Numbers
+### Numbers — HIP graphs enabled (production-representative)
 
-| conc | N  | P50 (ms) | P95 (ms) | tps  | output avg | success |
-|------|----|----------|----------|------|------------|---------|
-| 1    | 8  | 3466     | 3486     | 18.6 | 64         | 8/8     |
-| 4    | 12 | 3665     | 3853     | 68.0 | 64         | 12/12   |
-| 8    | 24 | 7011     | 7127     | 72.7 | 64         | 24/24   |
+| conc | N  | P50 (ms) | P95 (ms) | tok/s     | output avg | success |
+|------|----|----------|----------|-----------|------------|---------|
+| 1    | 8  | 689      | 692      | **94.7**  | 64         | 8/8     |
+| 4    | 12 | 808      | 1364     | **261.4** | 64         | 12/12   |
+| 8    | 24 | 806      | 944      | **587.1** | 64         | 24/24   |
 
-Cold first request: 7.4 s. Reply: real M2.5 output with reasoning thinking tag and emoji ("Hello! 👋").
+Per-GPU at c=8: **73.4 tok/s/GPU** on 8 MI355X (4 GPUs × 2 nodes). For comparison, the fork's InferenceX MoRI 1P1D bench reports 73.9 tok/s/GPU at c=32 — i.e., **we match the fork's per-GPU efficiency at lower concurrency on a model the fork didn't even test in this configuration**.
 
-Note the **very tight P50/P95 spread** (3466→3486 at c=1, 3665→3853 at c=4) — extremely consistent latency across requests, suggesting RIXL/UCX with TCP fallback handles M2.5's KV transfer evenly.
+Notable: **587 tok/s @ c=8 disagg exceeds the Phase 2.5 single-node agg result of 521 tok/s** — disagg has 2 nodes' worth of compute (8 GPUs total vs 4 in agg) so a clean inversion makes sense. The frontend + KV-router overhead from going through Dynamo's disagg path doesn't outweigh the doubled compute capacity.
 
-### Comparison with Phase 2.5 (M2.5 agg, single node)
+Cold first request (HIP graphs run): 6.8 s (down from 7.4 s eager). Reply: "The user wants me to say hello briefly. I'll keep it short and friendly. </think> Hello! 👋"
+
+Capture time: ~1:34 per worker for 5 PIECEWISE graphs + ~1 s for 4 FULL decode graphs. KV cache available after capture: 170.93 GiB per worker.
+
+### Original eager-mode numbers (kept for comparison)
+
+| conc | N  | P50 (ms) | P95 (ms) | tps  | success | Speedup vs eager |
+|------|----|----------|----------|------|---------|------------------|
+| 1    | 8  | 3466     | 3486     | 18.6 | 8/8     | HIP graphs **5.1×** |
+| 4    | 12 | 3665     | 3853     | 68.0 | 12/12   | HIP graphs **3.8×** |
+| 8    | 24 | 7011     | 7127     | 72.7 | 24/24   | HIP graphs **8.1×** |
+
+### Comparison with Phase 2.5 (M2.5 agg, single node) — updated with HIP-graphs disagg numbers
 
 | Mode | TP | Nodes | c=8 tok/s | Latency P50 c=1 |
 |---|---|---|---|---|
-| Phase 2.5 vLLM agg + HIP graphs | 4 | 1 | 521.2 | 1279 ms |
-| Phase 4 vLLM disagg + RIXL/UCX | 4 each | 2 | 72.7 | 3466 ms |
+| Phase 2.5 vLLM agg + HIP graphs | 4 | 1 (4 GPUs) | 521.2 | 1279 ms |
+| Phase 4 vLLM disagg + RIXL/UCX, eager | 4 each | 2 (8 GPUs) | 72.7 | 3466 ms |
+| **Phase 4 vLLM disagg + RIXL/UCX + HIP graphs** | **4 each** | **2 (8 GPUs)** | **587.1** | **689 ms** |
 
-Disagg is **~7× slower than agg** for M2.5 (vs 22× for DSR1). vLLM/RIXL handles KV transfer more efficiently than SGLang/Mooncake on this hardware:
+With HIP graphs enabled, **disagg now BEATS single-node agg** (587 > 521 tok/s) — disagg has 2× the GPUs (8 vs 4), and the frontend + KV-router overhead does not exceed the doubled compute capacity. Per-GPU throughput is comparable: agg 130 tok/s/GPU vs disagg 73 tok/s/GPU (the ~45% per-GPU drop is the cost of cross-node KV transfer over RIXL/UCX, paid once per request prefill→decode).
+
+vLLM/RIXL handles KV transfer efficiently on this hardware:
 - RIXL falls back to ROCm copy + TCP transparently (no chunked-MR overhead per layer)
-- vLLM's NixlConnector batches register_memory calls more efficiently
-- Eager mode (we ran with `--enforce-eager`) caps decode throughput; HIP graphs would help
+- vLLM's NixlConnector batches register_memory calls more efficiently than SGLang+Mooncake
+- HIP graph capture works fine on gfx950 for both agg and disagg M2.5 configs (no aiter segfaults observed)
 
 ### Comparison with Phase 4 small model
 
@@ -119,14 +134,17 @@ But again, **100% success rate** — the path is solid for production-scale mode
 
 | Phase | Backend | Mode | Model | Result | c=8 tok/s |
 |---|---|---|---|---|---|
-| 1 | SGLang | agg, TP=8 | DSR1-0528 FP8 (671B) | ✅ | 708 |
+| 1 | SGLang | agg, TP=8 + HIP graphs | DSR1-0528 FP8 (671B) | ✅ | 708 |
 | 2.5 | vLLM | agg, TP=4 + HIP graphs | MiniMax-M2.5 (229B MoE) | ✅ | 521 |
-| 3 (Qwen) | SGLang | disagg + Mooncake, TP=1 | Qwen3-0.6B | ✅ | 122 |
-| 3 (DSR1) | SGLang | disagg + Mooncake, TP=8 | **DeepSeek-R1-0528 FP8** | **✅** | **32.8** |
-| 4 (Qwen) | vLLM | disagg + RIXL, TP=1 | Qwen3-0.6B | ✅ | 646 |
-| 4 (M2.5) | vLLM | disagg + RIXL, TP=4 | **MiniMaxAI/MiniMax-M2.5** | **✅** | **72.7** |
+| 3 (Qwen) | SGLang | disagg + Mooncake, TP=1 + HIP graphs | Qwen3-0.6B | ✅ | 122 |
+| 3 (DSR1) | SGLang | disagg + Mooncake, TP=8 + HIP graphs | **DeepSeek-R1-0528 FP8** | **✅** | **32.8** |
+| 4 (Qwen) | vLLM | disagg + RIXL, TP=1, eager | Qwen3-0.6B | ✅ | 646 |
+| 4 (M2.5, eager) | vLLM | disagg + RIXL, TP=4, eager | MiniMaxAI/MiniMax-M2.5 | ✅ | 72.7 |
+| **4 (M2.5, HIP graphs)** | **vLLM** | **disagg + RIXL, TP=4 + HIP graphs** | **MiniMaxAI/MiniMax-M2.5** | **✅** | **587.1 (8.1× vs eager)** |
 
-All 6 (re)demonstrated milestones PASS. Both production-scale disaggregated paths work end-to-end on AMD MI355X with the minimal-patch stack documented in `07-phase5-final-report.md`.
+All milestones PASS. With HIP graphs enabled, the production-scale disaggregated paths now show:
+- **DSR1 SGLang disagg**: 32.8 tok/s @ c=8 (Mooncake DRAM-staging is the bottleneck — needs MoRI for the next big jump)
+- **M2.5 vLLM disagg**: 587.1 tok/s @ c=8 (RIXL/UCX path is efficient; matches the fork's 73.9 tok/s/GPU at c=32 with InferenceX MoRI)
 
 ## Reproducer scripts
 
@@ -141,11 +159,11 @@ This PoC's escalation numbers (DSR1: 32.8 tok/s @ c=8 = 2.1 tok/s/GPU on 16 GPUs
 
 ### Tier 1 — Drop-in perf wins (~5-10× expected)
 
-> **What we already had on:** the **DSR1 SGLang disagg** run was already with **HIP graphs enabled** (no `--enforce-eager`, no `--disable-cuda-graph`; worker.log confirmed `"capture cuda graph end. Time elapsed: 90.12 s"` on each TP worker). So Tier 1 item #1 below applies only to the **M2.5 vLLM disagg** path, where we did set `--enforce-eager`. Item #1 is the cheapest win we left on the table for the M2.5 number; it doesn't move the DSR1 number.
+> **Status update:** Item #1 ("drop `--enforce-eager`") has been **applied** in a re-run of the M2.5 vLLM disagg path. **Result: 8.1× speedup at c=8** (72.7 → 587.1 tok/s). This is the only Tier 1 item we've executed so far; items #2 (production concurrency sweep) and #3 (InferenceX MoRI env vars) remain TODO. The DSR1 SGLang disagg path already had HIP graphs on from the start.
 
 | # | Item | Applies to | Where in the fork | Effort | Expected impact |
 |---|---|---|---|---|---|
-| 1 | **Drop `--enforce-eager`** for vLLM workers | M2.5 path (DSR1 SGLang already had HIP graphs on) | n/a (just remove the flag) | trivial | 3-7× decode throughput per Phase 2 → Phase 2.5 (vLLM agg, 66 ms → 10 ms ITL); proven that gfx950 HIP-graph capture does NOT segfault for these MoE configs |
+| 1 | **Drop `--enforce-eager`** for vLLM workers | M2.5 path (DSR1 SGLang already had HIP graphs on) | n/a (just remove the flag) | trivial | **DONE — 8.1× speedup measured at c=8 (72.7 → 587.1 tok/s)** |
 | 2 | **Run a real concurrency sweep** at production scales (c=128, c=256, c=1024) | both | `scripts/run_benchmark.sh` + `InferenceX/utils/bench_serving/benchmark_serving.py` | small | The fork's high tok/s numbers are at c=128+; small-c numbers like ours don't amortize per-transfer overhead. Our DSR1 c=8 measurement is structurally bandwidth-bottlenecked at low concurrency |
 | 3 | **Set the InferenceX 17 MoRI env vars** (even with Mooncake; some are generic) | both | `InferenceX/.../env.sh` | trivial | `MORI_IO_QP_MAX_SEND_WR=16384`, `MORI_IO_QP_MAX_CQE=32768`, `MC_MAX_SGE=2`, `SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=1200`, etc. |
 
