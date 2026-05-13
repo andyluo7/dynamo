@@ -45,21 +45,33 @@ numbers because:
   + SGLANG_MORI_NUM_WORKERS=4 + --enable-two-batch-overlap` config exceeds
   the available VRAM headroom for MoRI's per-QP DRAM staging buffers.
 
-## Tuning iteration log (4 candidate fixes from earlier doc)
+## Tuning iteration log
 
-| Fix candidate | First sweep | Second sweep |
-|---|---|---|
-| `SGLANG_MORI_FP8_DISP` | False | **True** (fork value) |
-| `--enable-two-batch-overlap` | absent | **present** (fork value) |
-| `MORI_RDMA_TC` | 96 | **104** (alt cluster QoS) |
-| `SGLANG_MORI_QP_PER_TRANSFER` | 1 (default) | **4** |
-| `SGLANG_MORI_NUM_WORKERS` | 1 (default) | **4** |
-| **Result** | crash @ c=4 (RDMA assertion) | **c=4 OK**, crash @ c=8 (OOM on decode) |
+| Fix candidate | Round 1 | Round 2 | **Round 3** |
+|---|---|---|---|
+| `SGLANG_MORI_FP8_DISP` | False | **True** | **True** |
+| `--enable-two-batch-overlap` | absent | **present** | **present** |
+| `MORI_RDMA_TC` | 96 | **104** | **104** |
+| `SGLANG_MORI_QP_PER_TRANSFER` | 1 | 4 | **1** (back to default) |
+| `SGLANG_MORI_NUM_WORKERS` | 1 | 4 | **2** |
+| `--mem-fraction-static` | 0.72 | 0.72 | **0.65** |
+| **Result @ c=4** | crash (RDMA assertion) | OK (96.1 tok/s) | **OK (97.3 tok/s)** |
+| **Result @ c=8** | (not reached) | crash (`std::bad_alloc`) | **crash (`KV transfer failed: Work Request Flushed Error`)** |
 
-So the four fixes resolved the RDMA control-plane assertion (the MoRI
-`hdr.type == MessageType::RegEndpoint` failure stopped firing) but moved
-the wall to memory: the larger MoRI per-QP buffer footprint at higher
-concurrency exceeds VRAM headroom.
+The wall has moved through three different failure modes:
+- **Round 1**: MoRI control-plane handshake assertion (fixed by FP8/two-batch-overlap/RDMA-TC).
+- **Round 2**: VRAM `std::bad_alloc` on decode (fixed by smaller MoRI per-QP buffers + lower mem-fraction).
+- **Round 3**: ionic NIC RDMA QPs go into Error State and flush all in-flight Work Requests. MoRI's own error message says: *"Flush errors are cascaded from QP(s) entering Error State. Check: (1) peer process alive, (2) PFC / network congestion, (3) ibv_devinfo / dmesg for HW errors."*
+
+**Round 3 c=8+ failure is at the NIC layer**, not in our software stack. Symptoms (`Work Request Flushed Error` cascading from one QP) are textbook PFC/lossless-RoCE configuration issues. The fork's runbook is silent about PFC tuning, which suggests their cluster has PFC enabled NIC-wide. AAC1's ionic NICs may not (and configuring PFC is a cluster-admin operation, not ours).
+
+## Round 3 sweep results (current best)
+
+| c | n_prompts | TPOT P50 | TTFT P50 | tok/s/req | **tok/s aggregate** | success | vs fork |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 10 | 39.8 ms | 794 ms | 25.2 | 24.8 | 10/10 | (fork: 97.7 → 25%) |
+| 4 | 40 | 40.1 ms | 294 ms | 24.7 | **97.3** | 40/40 | (fork: 178 → **55%**) |
+| 8+ | — | — | — | — | crash (RDMA flush) | — | (fork: 672 @ c=16) |
 
 ## What broke during the sweep
 

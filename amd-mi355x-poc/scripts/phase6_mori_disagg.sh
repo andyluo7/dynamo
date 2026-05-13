@@ -31,11 +31,11 @@ export SGLANG_USE_AITER=1
 export MORI_SHMEM_MODE=ISOLATION
 export SGLANG_MORI_DISPATCH_DTYPE=bf16
 export SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK=4096
-export SGLANG_MORI_FP8_DISP=True   # fork uses True for DSR1
+export SGLANG_MORI_FP8_DISP=True
 export SGLANG_MORI_FP8_COMB=False
-# More QPs + workers for higher concurrency stability
-export SGLANG_MORI_QP_PER_TRANSFER=4
-export SGLANG_MORI_NUM_WORKERS=4
+# Round 3: pull back QP/workers to fix c=8 OOM on decode
+export SGLANG_MORI_QP_PER_TRANSFER=1
+export SGLANG_MORI_NUM_WORKERS=2
 export SGLANG_MORI_POST_BATCH_SIZE=-1
 export MORI_MAX_DISPATCH_TOKENS_PREFILL=16384
 export MORI_MAX_DISPATCH_TOKENS_DECODE=160
@@ -74,7 +74,7 @@ COMMON="--model-path $MODEL \
     --load-balance-method round_robin \
     --moe-dense-tp-size 1 \
     --enable-dp-lm-head \
-    --mem-fraction-static 0.72 \
+    --mem-fraction-static 0.65 \
     --chunked-prefill-size 32768 \
     --max-running-requests 128 \
     --context-length 12288 \
