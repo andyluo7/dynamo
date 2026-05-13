@@ -31,12 +31,16 @@ export SGLANG_USE_AITER=1
 export MORI_SHMEM_MODE=ISOLATION
 export SGLANG_MORI_DISPATCH_DTYPE=bf16
 export SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK=4096
-export SGLANG_MORI_FP8_DISP=False
+export SGLANG_MORI_FP8_DISP=True   # fork uses True for DSR1
 export SGLANG_MORI_FP8_COMB=False
+# More QPs + workers for higher concurrency stability
+export SGLANG_MORI_QP_PER_TRANSFER=4
+export SGLANG_MORI_NUM_WORKERS=4
+export SGLANG_MORI_POST_BATCH_SIZE=-1
 export MORI_MAX_DISPATCH_TOKENS_PREFILL=16384
 export MORI_MAX_DISPATCH_TOKENS_DECODE=160
 export SGLANG_MORI_DISPATCH_INTER_KERNEL_SWITCH_THRESHOLD=320
-export MORI_RDMA_TC=96
+export MORI_RDMA_TC=104  # try 104 (was 96; assertion fired on subsequent req)
 export MORI_APP_LOG_LEVEL=INFO
 export MORI_EP_LAUNCH_CONFIG_MODE=AUTO
 export MORI_IO_QP_MAX_SEND_WR=16384
@@ -65,6 +69,7 @@ COMMON="--model-path $MODEL \
     --tp-size $TP --ep-size $TP --dp-size $TP \
     --enable-dp-attention \
     --moe-a2a-backend mori \
+    --enable-two-batch-overlap \
     --trust-remote-code \
     --load-balance-method round_robin \
     --moe-dense-tp-size 1 \

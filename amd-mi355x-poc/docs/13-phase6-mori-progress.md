@@ -14,8 +14,52 @@ Model: `deepseek-ai/DeepSeek-R1-0528` FP8, TP=8 / EP=8 / DP=8 + DP-Attn
 | 1 | rocm/sgl-dev image already ships MoRI (`/sgl-workspace/mori/`) — **no build needed** |
 | 2 | MoRI-EP single-node smoke (TP=8 EP=8 DP=8 + `--moe-a2a-backend mori`) — **PASS**, ~11 min from launch to ready, chat completion 200 OK |
 | 3 | MoRI-IO 2-node disagg setup — **PASS** for single request after `sglang_router.launch_router --pd-disaggregation --mini-lb` is started with prefill IP (not localhost), libionic host mounts present |
-| 4 | Concurrency sweep at c=1,4,8,16,32,64,128 — **FAIL across the board** with `ChunkedEncodingError: Response ended prematurely` |
-| 5 | Fork-comparable numbers (178/672/2196 tok/s) — **not yet reached** |
+| 4 | Concurrency sweep at c=1, 4 with tuned config (SGLANG_MORI_FP8_DISP=True, QP_PER_TRANSFER=4, NUM_WORKERS=4, --enable-two-batch-overlap, MORI_RDMA_TC=104) — **PARTIAL PASS** |
+| 5 | c=8 onward — **FAIL** with `std::bad_alloc` on decode (memory pressure from larger MoRI per-QP buffers × workers × overlap pipeline) |
+| 6 | Fork-comparable numbers — **partial** (54% of fork's c=4 number; c=16/128 not yet reached) |
+
+## Sweep results so far
+
+| c | n_prompts | TPOT P50 | TTFT P50 | tok/s/req | **tok/s aggregate** | success | vs fork |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 10 | 39.4 ms | 1,477 ms | 25.6 | 24.9 | 10/10 | (fork: 97.7 → ~25%) |
+| 4 | 40 | 40.4 ms | 301 ms | 23.9 | **96.1** | 40/40 | (fork: 178 → **54%**) |
+| 8 | 80 | — | — | — | crash (`std::bad_alloc`) | — | — |
+| 16 | 160 | — | — | — | not reached | — | (fork: 672) |
+| 32 | 320 | — | — | — | not reached | — | — |
+| 64 | 640 | — | — | — | not reached | — | — |
+| 128 | 1280 | — | — | — | not reached | — | (fork: 2196) |
+
+The c=1 and c=4 numbers are the **first AMD MI355X SGLang+MoRI-IO disagg
+numbers we have on this PoC**. They are already meaningful — disagg is
+end-to-end functional, the router routes correctly, the bootstrap
+handshake completes — but they are nowhere near the fork's published
+numbers because:
+
+- TPOT @ c=1 is **39.4 ms** vs fork's Mooncake 9.46 ms vs fork's MoRI ~7 ms.
+  4× too slow. Most likely: aiter MoE preshuffle still untuned for our
+  exact MI355X firmware, MoRI dispatch dtype not optimal, missing
+  `--enforce-shared-experts-fusion`, and/or the KV-cache layout is FA
+  instead of FlashInfer (MoRI prefers FI for less metadata overhead).
+- c=8 OOM means our `--mem-fraction-static 0.72 + SGLANG_MORI_QP_PER_TRANSFER=4
+  + SGLANG_MORI_NUM_WORKERS=4 + --enable-two-batch-overlap` config exceeds
+  the available VRAM headroom for MoRI's per-QP DRAM staging buffers.
+
+## Tuning iteration log (4 candidate fixes from earlier doc)
+
+| Fix candidate | First sweep | Second sweep |
+|---|---|---|
+| `SGLANG_MORI_FP8_DISP` | False | **True** (fork value) |
+| `--enable-two-batch-overlap` | absent | **present** (fork value) |
+| `MORI_RDMA_TC` | 96 | **104** (alt cluster QoS) |
+| `SGLANG_MORI_QP_PER_TRANSFER` | 1 (default) | **4** |
+| `SGLANG_MORI_NUM_WORKERS` | 1 (default) | **4** |
+| **Result** | crash @ c=4 (RDMA assertion) | **c=4 OK**, crash @ c=8 (OOM on decode) |
+
+So the four fixes resolved the RDMA control-plane assertion (the MoRI
+`hdr.type == MessageType::RegEndpoint` failure stopped firing) but moved
+the wall to memory: the larger MoRI per-QP buffer footprint at higher
+concurrency exceeds VRAM headroom.
 
 ## What broke during the sweep
 
@@ -50,14 +94,29 @@ So MoRI-IO RDMA handshake works for the first one or two requests, then fails wh
 - **MoRI-IO 2-node bring-up** sequence: launch prefill server (`--disaggregation-mode prefill --disaggregation-transfer-backend mori`), launch decode server (same with decode), then `sglang_router.launch_router --pd-disaggregation --mini-lb --prefill <PREFILL_IP>:8001 30001 --decode <DECODE_IP>:8002 --port 8000`. Single request through the router routes correctly.
 - **Required mounts** beyond the image: `/etc/libibverbs.d/ionic.driver`, `libionic.so*` chain, `libionic-rdmav34.so` — same as Phases 3-4. Without these the container's libionic kernel-ABI mismatch makes ionic invisible to MoRI.
 
-## Next workstream
+## Next workstream (to close the gap to fork's numbers)
 
-To get the fork's numbers reproduced:
+In priority order:
 
-1. Re-run with `SGLANG_MORI_FP8_DISP=True` and `--enable-two-batch-overlap`.
-2. Pin `MORI_IO_HANDSHAKE_PORT` and `MORI_IO_NOTIFY_PORT` if the env-var names exist (otherwise look at fork's launch script for the actual override path).
-3. Try lower concurrency first (c=1, c=4 only) and verify each level is stable for 1-2 minutes before stepping up.
-4. If RDMA assertion still fires, instrument MoRI's `BuildRdmaConn` (it's open-source at `/sgl-workspace/mori/src/io/rdma/backend_impl.cpp:801`) to log the actual `hdr.type` value seen vs expected — that will tell us whether it's a message corruption or a protocol-version mismatch.
+1. **Fix c=8 OOM**: lower one or more of `SGLANG_MORI_QP_PER_TRANSFER` (4→1
+   or 2), `SGLANG_MORI_NUM_WORKERS` (4→2), or `--mem-fraction-static`
+   (0.72→0.65). Needs a dimensional analysis of MoRI's per-QP × per-worker
+   buffer footprint vs VRAM headroom.
+2. **Fix the 4× TPOT gap @ c=1** (39.4 ms vs fork's 9.46 ms with Mooncake,
+   ~7 ms with MoRI):
+   - Add `--enforce-shared-experts-fusion` (fork's runbook flags it as
+     critical for DSR1 perf).
+   - Verify `SGLANG_MORI_DISPATCH_DTYPE` matches DSR1's expert weight
+     dtype (we set bf16; FP8 may be more efficient with FP8 weights).
+   - Check whether `aiter` MoE preshuffle is enabled / cached — first run
+     pays preshuffle cost.
+   - Try `--cuda-graph-max-bs 64` instead of 32 (fork's c=128 setup uses
+     larger graphs).
+3. **Re-run sweep at c=1, 4, 8 only** with stable config to lock in the
+   numbers, then extend to c=16, 32, 128 on a follow-up.
+4. **For the truly-headline 1,334 tok/s/GPU DEP8 number**: requires
+   multi-node DEP=8 (8 nodes × 8 GPUs = 64 GPUs total) — out of scope
+   for this 2-node setup.
 
 ## Reproducer
 
