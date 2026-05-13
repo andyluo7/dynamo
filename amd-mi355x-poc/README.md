@@ -11,16 +11,16 @@ new lives under this `amd-mi355x-poc/` subdirectory and is applied at runtime
 by the launch scripts. The objective was to identify the **minimum** set of
 changes upstream `ai-dynamo/dynamo:main` would need to support AMD MI355X.
 
-## Three findings to take away
+## Four findings to take away
 
 1. **Single-node aggregated Dynamo on AMD requires essentially zero patches**
    to upstream `dynamo` source. PRs 1, 2 in the breakdown below are mergeable
    today.
 
 2. **vLLM + RIXL disaggregated serving is production-ready on AMD ionic
-   hardware today.** Saturates cleanly at the **compute** ceiling (730 tok/s
-   aggregate at c=32, 320/320 success on M2.5). PR 5 captures the dynamo-side
-   bits — also mergeable today.
+   hardware for medium-KV models.** Saturates cleanly at the **compute**
+   ceiling on M2.5 (730 tok/s aggregate at c=32, 320/320 success). PR 5
+   captures the dynamo-side bits — also mergeable today.
 
 3. **SGLang + Mooncake disaggregated has a transport ceiling at c=32 on
    ionic.** Matches the JohnQinAMD fork's documented finding. We exceed the
@@ -28,6 +28,15 @@ changes upstream `ai-dynamo/dynamo:main` would need to support AMD MI355X.
    c=4) and reach 527 tok/s @ c=16, but Mooncake crashes with cascading
    `transport retry counter exceeded` at c=32. The fork uses MoRI for c>16
    production benchmarks; that's the next workstream, not a PoC blocker.
+
+4. **Public RIXL also has a ceiling on DSR1-class models — at startup, not
+   under load.** Same RIXL+UCX-ROCm stack that runs M2.5 cleanly fails to
+   `ibv_reg_mr` DSR1's 1.7-2.6 GB per-rank KV pool against ionic
+   (~250 MB per-MR limit). The MR-chunking that Mooncake's fork-staging code
+   does (and that MoRI does properly) is what's missing from public RIXL.
+   See [`docs/12-dsr1-vllm-rixl-cross-validation.md`](docs/12-dsr1-vllm-rixl-cross-validation.md). This sharpens the upstream story:
+   PR 5 is correct and mergeable today, but **the right scope-statement for
+   public RIXL on ionic is "medium-KV per rank"**, not "all models".
 
 ## Results — all milestones PASS
 
@@ -42,6 +51,7 @@ Hardware: 2× 8-GPU MI355X nodes, each with 9× AMD Pensando ionic RoCE NICs.
 | 2.5 | vLLM | single-node agg, TP=4 + HIP graphs | MiniMax-M2.5 FP8 (229B MoE) | **521** @ c=8 | compute | 24/24 |
 | 3 | SGLang | 2-node disagg + Mooncake, TP=8 each | DeepSeek-R1-0528 FP8 (671B) | **527** @ c=16 ¹ | **transport (Mooncake @ c=32)** | 160/160 |
 | 4 | vLLM | 2-node disagg + RIXL/UCX, TP=4 each | MiniMaxAI/MiniMax-M2.5 (229B MoE) | **730** @ c=32 ² | compute | 320/320 |
+| 4-DSR1 | vLLM | 2-node disagg + RIXL/UCX, TP=8 each | DeepSeek-R1-0528 FP8 (671B) | n/a — startup fails | **MR-size limit (ionic)** ³ | n/a |
 
 ### Side-by-side: same hardware, different transport
 
@@ -68,6 +78,8 @@ This is the architectural difference at the heart of finding #3. **RIXL's UCX-pl
 ¹ DSR1 SGLang+Mooncake disagg headline: **527.4 tok/s @ c=16 with 160/160 success — 16× over the conservative 32.8 tok/s baseline measured before fork-aligned tuning**. Crashed at c=32 (transport retry exceeded). See [`docs/10-dsr1-concurrency-sweep.md`](docs/10-dsr1-concurrency-sweep.md). Initial M2.5 disagg run with `--enforce-eager` measured 72.7 tok/s @ c=8; HIP graphs gave 8.1× speedup to 587. Initial DSR1 disagg measurement was 32.8 tok/s aggregate @ c=8 with a conservative launch config; applying the fork's exact launch flags + 9 env vars + matching bench harness raised per-request output throughput to **105.7 tok/s — 8.2% above the fork's published Test 12 result of 97.7 tok/s on the same Mooncake transport**, see [`docs/09-test12-reproduction.md`](docs/09-test12-reproduction.md).
 
 ² M2.5 vLLM+RIXL disagg headline: **730.4 tok/s @ c=32 with 320/320 success**. Performance saturates at compute (c=8/16/32 all hit ~720-730 tok/s aggregate; TTFT grows from 131ms to 33.6s but throughput plateaus). To go higher requires more decode GPUs or a smaller model. Detailed sweep + RIXL-vs-Mooncake architectural analysis in [`docs/11-m25-vllm-rixl-sweep.md`](docs/11-m25-vllm-rixl-sweep.md).
+
+³ DSR1 vLLM+RIXL cross-validation: same RIXL+UCX-ROCm stack that runs M2.5 cleanly cannot complete `ibv_reg_mr` for DSR1's 1.7-2.6 GB per-rank KV-pool MR against ionic (~250 MB per-MR limit). Two attempts (max-num-seqs=32 and =4) both `NIXL_ERR_BACKEND` at startup. This is the fundamental MR-size ceiling for vanilla public RIXL on ionic — completes the architectural story: M2.5 fits, DSR1 doesn't, neither public transport handles DSR1 at production scale on this NIC. Full reproducer + log excerpts in [`docs/12-dsr1-vllm-rixl-cross-validation.md`](docs/12-dsr1-vllm-rixl-cross-validation.md).
 
 The remaining gap to the fork's headline 1,334 tok/s/GPU DEP8 result requires building MoRI from source, applying EP/DP-Attention, and a few additional patches — see [Path to Production Performance](docs/08-phase34-escalation-results.md#path-to-production-performance) in the escalation doc for the full 13-item list.
 
@@ -102,7 +114,8 @@ amd-mi355x-poc/
 │   ├── 10-dsr1-concurrency-sweep.md       ← DSR1 sweep, hits Mooncake ionic ceiling
 │   ├── 10-dsr1-sweep-results.csv          ← raw per-c CSV from the DSR1 sweep
 │   ├── 11-m25-vllm-rixl-sweep.md          ← M2.5 sweep, RIXL has no transport ceiling
-│   └── 11-m25-sweep-results.csv           ← raw per-c CSV from the M2.5 sweep
+│   ├── 11-m25-sweep-results.csv           ← raw per-c CSV from the M2.5 sweep
+│   └── 12-dsr1-vllm-rixl-cross-validation.md  ← DSR1+RIXL hits ionic MR-size limit at startup
 ├── scripts/                               ← reproducer scripts (run from AAC1 login node)
 │   ├── phase1_e2e.sh                      ← SGLang+DSR1 single-node + bench
 │   ├── phase2_e2e.sh                      ← vLLM+MiniMax-M2.5 single-node (eager)
@@ -116,6 +129,7 @@ amd-mi355x-poc/
 │   ├── test12_sweep.sh                    ← DSR1 concurrency sweep (calls test12_bench.py)
 │   ├── phase4_disagg.sh                   ← vLLM 1P1D Qwen3-0.6B disagg with RIXL
 │   ├── phase4_m25_disagg.sh               ← vLLM 1P1D M2.5 disagg with RIXL + HIP graphs
+│   ├── phase4_dsr1_disagg.sh              ← vLLM 1P1D DSR1 disagg attempt (MR-size cross-validation)
 │   ├── phase4_bench.py                    ← Phase 4 single-c bench
 │   ├── m25_bench.py                       ← M2.5 single-c bench
 │   ├── m25_sweep.sh                       ← M2.5 concurrency sweep
