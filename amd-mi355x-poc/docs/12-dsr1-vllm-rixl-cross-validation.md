@@ -81,18 +81,52 @@ listed earlier:
 8. The all-9-ionic-devices auto-discovery path — fine when not done from
    inside vLLM.
 
-**The remaining candidate for the vLLM failure is therefore the TP=8
-multiprocessing worker context.** vLLM spawns 8 worker processes (one per
-TP rank), each independently imports vLLM, NIXL, UCX, allocates VRAM via
-PyTorch, and calls `register_memory` simultaneously. Our `ionic_multiproc_probe.sh`
-showed 8 plain libibverbs processes each registering 2.58 GiB succeed, but
-that probe does NOT exercise NIXL or PyTorch — only raw `ibv_reg_mr`. A
-proper test would be 8 forked Python processes each running
-`nixl_pytorch_probe.py` simultaneously.
+We then ran exactly that probe, plus a memory-pressure variant:
 
-This is the right next step for whoever wants to actually pin the vLLM
-failure. It is no longer reasonable to attribute the failure to ionic
-itself.
+| Probe | Configuration | Result |
+|---|---|---|
+| `nixl_multiproc_probe.sh 8 2638 1` | 8 procs × 1 region × 2.638 GiB via NIXL+PyTorch | **all 8 OK** |
+| `nixl_multiproc_probe.sh 8 256 60` | 8 procs × 60 regions × 256 MiB = 120 GiB total NIXL+VRAM | **all 8 OK** |
+| `nixl_after_weights_probe.py 80 2638` | 80 GiB "weight" tensors pre-allocated, then 2.638 GiB NIXL register | **OK** |
+
+So the additional ruled-out causes are:
+
+9. Multi-process Python+NIXL+PyTorch with the exact TP=8 process count and
+   2.638 GiB region size that vLLM uses — works.
+10. High region-count per process (60 regions per process, matching DSR1's
+    layer count) — works.
+11. Memory-pressure / VRAM-fragmentation after large pre-allocation
+    (mimicking model-load state) — works.
+
+## Final conclusion
+
+After eliminating eleven candidate causes through standalone probes that mirror
+every infrastructure layer below vLLM's NixlConnector, **the DSR1+vLLM+RIXL
+startup crash cannot be explained by anything in the ionic NIC, ibv MR
+limits, UCX/RIXL Python wrappers, multi-process spawning, multi-region
+registration, PyTorch allocator, or weight-allocation memory pressure
+layers**. The standalone path handles all of these cleanly at sizes
+significantly exceeding what vLLM attempts.
+
+The remaining candidates that the standalone probes do NOT cover are
+vLLM-internal:
+
+- vLLM's NixlConnector setup with specific role config (prefill vs decode)
+  and inter-agent side-channel handshake
+- Interaction with vLLM's TP collective initialization order
+- A connector-config field passed to `register_memory` that we are not
+  matching
+
+To pin the actual root cause, the right next step is **direct
+instrumentation inside vLLM's NixlConnector worker.py:929**, not another
+standalone probe. The first three failure logs from the worker should be
+diff'd line-by-line against a successful `nixl_pytorch_probe.py` UCX log
+to spot what UCX is doing differently.
+
+In the meantime, **the architectural framing for the upstream PR is the
+right one**: PR 5 is validated production-ready on M2.5 class, DSR1
+needs follow-up — but the follow-up is a vLLM connector-side investigation,
+not an AMD/ionic/transport-side fix. From AMD's side the stack is fine.
 
 ## Numbers (the failure observation, kept for completeness)
 
