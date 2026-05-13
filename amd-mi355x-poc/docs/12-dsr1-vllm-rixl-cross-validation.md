@@ -58,8 +58,41 @@ do NOT cover:
    the same VRAM region.
 
 Distinguishing among (1)-(4) requires a probe that mirrors RIXL's full
-`ucp_mem_map` flow on PyTorch-allocated memory — not in scope for this
-PoC, but worth flagging to whoever picks this up next.
+`ucp_mem_map` flow on PyTorch-allocated memory — that probe is now in
+[`scripts/probes/nixl_pytorch_probe.py`](../scripts/probes/nixl_pytorch_probe.py)
+and **also succeeds** for everything we've tested:
+
+| Probe configuration | Result |
+|---|---|
+| 1 region × 2.638 GiB PyTorch VRAM, all 9 ionic devs (default UCX) | OK |
+| 16 regions × 1 GiB PyTorch VRAM = 16 GiB, all 9 ionic devs | OK |
+| Same as above with `UCX_RCACHE_MAX_UNRELEASED=4` (tiny rcache) | OK |
+| Same with `LD_PRELOAD=ibv_ionic_compat.so` | OK |
+| Same without `LD_PRELOAD` | OK |
+
+So we have now ruled out, in addition to the ionic per-MR size hypotheses
+listed earlier:
+
+5. NIXL/RIXL Python wrapper itself — fine for the size class and region count
+   that vLLM hits.
+6. UCX registration cache (`UCX_RCACHE_MAX_UNRELEASED`) — fine even at very
+   low values.
+7. PyTorch's caching allocator interaction — fine.
+8. The all-9-ionic-devices auto-discovery path — fine when not done from
+   inside vLLM.
+
+**The remaining candidate for the vLLM failure is therefore the TP=8
+multiprocessing worker context.** vLLM spawns 8 worker processes (one per
+TP rank), each independently imports vLLM, NIXL, UCX, allocates VRAM via
+PyTorch, and calls `register_memory` simultaneously. Our `ionic_multiproc_probe.sh`
+showed 8 plain libibverbs processes each registering 2.58 GiB succeed, but
+that probe does NOT exercise NIXL or PyTorch — only raw `ibv_reg_mr`. A
+proper test would be 8 forked Python processes each running
+`nixl_pytorch_probe.py` simultaneously.
+
+This is the right next step for whoever wants to actually pin the vLLM
+failure. It is no longer reasonable to attribute the failure to ionic
+itself.
 
 ## Numbers (the failure observation, kept for completeness)
 
