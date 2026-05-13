@@ -38,9 +38,13 @@ for i in range(n_regions):
 torch.cuda.synchronize()
 
 print("\nimporting nixl ...")
-from nixl._api import nixl_agent
-print("creating nixl agent ...")
-agent = nixl_agent("probe_agent")
+from nixl._api import nixl_agent, nixl_agent_config
+print("creating nixl agent (mimicking vLLM: num_threads=4) ...")
+n_threads = int(os.environ.get("PROBE_NUM_THREADS", "4"))
+config = nixl_agent_config(num_threads=n_threads, capture_telemetry=True)
+print(f"  config: num_threads={n_threads} capture_telemetry=True")
+import uuid
+agent = nixl_agent(str(uuid.uuid4()), config)
 print(f"  backends available: {agent.get_plugin_list()}")
 print(f"  agent.backends keys: {list(agent.backends.keys())}")
 print(f"  agent.backends['UCX']: {agent.backends.get('UCX')}")

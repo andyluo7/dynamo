@@ -88,6 +88,8 @@ We then ran exactly that probe, plus a memory-pressure variant:
 | `nixl_multiproc_probe.sh 8 2638 1` | 8 procs × 1 region × 2.638 GiB via NIXL+PyTorch | **all 8 OK** |
 | `nixl_multiproc_probe.sh 8 256 60` | 8 procs × 60 regions × 256 MiB = 120 GiB total NIXL+VRAM | **all 8 OK** |
 | `nixl_after_weights_probe.py 80 2638` | 80 GiB "weight" tensors pre-allocated, then 2.638 GiB NIXL register | **OK** |
+| `nixl_pytorch_probe.py 2638 1` with `nixl_agent_config(num_threads=4, capture_telemetry=True)` + uuid agent name (matches vLLM's NixlWrapper init exactly) | **OK** |
+| `nixl_multiproc_probe.sh 8 2638 1` with `PROBE_NUM_THREADS=4` (matches vLLM TP=8 + num_threads exactly) | **all 8 OK** |
 
 So the additional ruled-out causes are:
 
@@ -109,13 +111,27 @@ layers**. The standalone path handles all of these cleanly at sizes
 significantly exceeding what vLLM attempts.
 
 The remaining candidates that the standalone probes do NOT cover are
-vLLM-internal:
+vLLM-internal **integrated state** that exists in the worker by the time
+`register_memory` is called:
 
-- vLLM's NixlConnector setup with specific role config (prefill vs decode)
-  and inter-agent side-channel handshake
-- Interaction with vLLM's TP collective initialization order
-- A connector-config field passed to `register_memory` that we are not
-  matching
+- **RCCL/torch.distributed TP=8 process group** active (vLLM workers are
+  part of a torch.distributed group for TP collectives; RCCL opens its own
+  HIP streams that may interfere with UCX's ROCm transports). Our probes do
+  NOT initialize torch.distributed.
+- **HIP graph capture state**: vLLM workers do graph capture for the model
+  forward pass before KV registration; this leaves many HIP streams and
+  graphs allocated. Our probes have only the implicit default stream.
+- **vLLM's NixlConnector role config**: prefill vs decode workers may set
+  agent name/role specific to a side-channel handshake.
+- **PyTorch tensor allocation through vLLM's KV cache spec layers** rather
+  than direct `torch.zeros` — may use a non-default allocator pool.
+
+Confirmed it is NOT:
+
+- `nixl_agent_config(num_threads=4, capture_telemetry=True)` (vLLM's exact init args)
+- A uuid-based agent name (vLLM uses `str(uuid.uuid4())`)
+- `nixl_memory_type="VRAM"` (matches our probe)
+- `backends=["UCX"]` arg shape (matches our probe)
 
 To pin the actual root cause, the right next step is **direct
 instrumentation inside vLLM's NixlConnector worker.py:929**, not another
