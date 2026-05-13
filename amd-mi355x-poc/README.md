@@ -32,16 +32,24 @@ changes upstream `ai-dynamo/dynamo:main` would need to support AMD MI355X.
 **Open question (not a finding):** vLLM+RIXL on **DSR1** (TP=8, ~2.5 GB
 per-rank registration) crashes at startup with `NIXL_ERR_BACKEND` from a
 failed `ibv_reg_mr` call against ionic. We initially diagnosed this as an
-"ionic per-MR size ceiling" but **standalone libibverbs+HIP probes on the
-same node refute that** — ionic accepts up to 8 GiB ROCm/VRAM MRs, accepts
-`access=0xf` (REMOTE_ATOMIC included), and accepts 8 parallel processes each
-holding a 2.58 GiB MR. The actual failure mode is more specific (likely an
-interaction between PyTorch's VRAM allocator and UCX's multi-MD registration
-across 9 ionic devices) and needs further investigation. See
-[`docs/12-dsr1-vllm-rixl-cross-validation.md`](docs/12-dsr1-vllm-rixl-cross-validation.md).
+"ionic per-MR size ceiling" but **eleven standalone probes on the same image,
+node, and env disprove every infrastructure-layer hypothesis** — ionic, ibv
+MR limits, access flags, UCX rcache, NIXL/RIXL Python wrappers, multi-process
+spawning (matching TP=8 exactly), high region count, post-weight-load VRAM
+fragmentation: all clean. See [`docs/12-dsr1-vllm-rixl-cross-validation.md`](docs/12-dsr1-vllm-rixl-cross-validation.md)
+for the full elimination matrix and the eight reproducer probes in
+[`scripts/probes/`](scripts/probes/).
+
+The remaining candidates are vLLM-internal — most likely the NixlConnector
+role/handshake config, TP-collective interaction with UCX, or a connector
+flag the standalone probes are not matching. The right next step is direct
+instrumentation inside vLLM's `worker.py` `register_memory` call site, NOT
+another transport-layer fix.
+
 The honest scope-statement for PR 5: **validated production-ready on M2.5
-class, DSR1 needs follow-up — without overclaiming a root cause we have not
-yet pinned down.**
+class, DSR1 needs follow-up — but the follow-up is a vLLM connector-side
+investigation, not an AMD/ionic/transport fix. From AMD's side the stack
+is fine.**
 
 ## Results — all milestones PASS
 
@@ -56,7 +64,7 @@ Hardware: 2× 8-GPU MI355X nodes, each with 9× AMD Pensando ionic RoCE NICs.
 | 2.5 | vLLM | single-node agg, TP=4 + HIP graphs | MiniMax-M2.5 FP8 (229B MoE) | **521** @ c=8 | compute | 24/24 |
 | 3 | SGLang | 2-node disagg + Mooncake, TP=8 each | DeepSeek-R1-0528 FP8 (671B) | **527** @ c=16 ¹ | **transport (Mooncake @ c=32)** | 160/160 |
 | 4 | vLLM | 2-node disagg + RIXL/UCX, TP=4 each | MiniMaxAI/MiniMax-M2.5 (229B MoE) | **730** @ c=32 ² | compute | 320/320 |
-| 4-DSR1 | vLLM | 2-node disagg + RIXL/UCX, TP=8 each | DeepSeek-R1-0528 FP8 (671B) | n/a — startup fails | **`ibv_reg_mr` EINVAL — root cause not yet pinned** ³ | n/a |
+| 4-DSR1 | vLLM | 2-node disagg + RIXL/UCX, TP=8 each | DeepSeek-R1-0528 FP8 (671B) | n/a — startup fails | **`ibv_reg_mr` EINVAL — vLLM-internal, not AMD-side** ³ | n/a |
 
 ### Side-by-side: same hardware, different transport
 
@@ -67,7 +75,7 @@ Hardware: 2× 8-GPU MI355X nodes, each with 9× AMD Pensando ionic RoCE NICs.
 | 16 | 527.4 | 727.3 |
 | **32** | **CRASH** (transport retry exceeded) | **730.4 tok/s, 320/320 success** |
 
-This is the architectural difference at the heart of finding #3. **RIXL's UCX-plugin C++ DRAM staging handles ionic's MR limits gracefully where Mooncake's Python-level chunked-transfer pattern saturates the firmware's QP-setup queue.**
+This is the architectural difference at the heart of finding #3. **RIXL's UCX-plugin C++ transfer pipeline scales cleanly past where Mooncake's Python-level chunked register/transfer/deregister pattern saturates the ionic firmware's QP-setup queue.** (The earlier framing of this as "RIXL chunks MRs better than Mooncake" was wrong — see footnote ³ — RIXL doesn't chunk at all; the difference is in the UCX plugin's C++ transfer scheduling.)
 
 ### vs JohnQinAMD fork's published numbers
 
@@ -84,7 +92,7 @@ This is the architectural difference at the heart of finding #3. **RIXL's UCX-pl
 
 ² M2.5 vLLM+RIXL disagg headline: **730.4 tok/s @ c=32 with 320/320 success**. Performance saturates at compute (c=8/16/32 all hit ~720-730 tok/s aggregate; TTFT grows from 131ms to 33.6s but throughput plateaus). To go higher requires more decode GPUs or a smaller model. Detailed sweep + RIXL-vs-Mooncake architectural analysis in [`docs/11-m25-vllm-rixl-sweep.md`](docs/11-m25-vllm-rixl-sweep.md).
 
-³ DSR1 vLLM+RIXL cross-validation: vLLM crashes at startup with `ibv_reg_mr ... access=0xf failed: Invalid argument` → `NIXL_ERR_BACKEND`. **Initial "ionic per-MR size ceiling" diagnosis is RETRACTED** — standalone libibverbs+HIP probes on the same node show ionic accepts 8 GiB single-process MRs, 32×2 GiB concurrent MRs in one process (64 GiB cumulative), 8-process parallel 2.58 GiB MRs each, and `access=0xf` flag combinations. The real root cause is more specific (likely PyTorch VRAM allocator × UCX multi-MD-on-9-ionic-devices interaction) and needs further investigation. Full probe results + corrected diagnosis in [`docs/12-dsr1-vllm-rixl-cross-validation.md`](docs/12-dsr1-vllm-rixl-cross-validation.md). All five probes are in [`scripts/probes/`](scripts/probes/) for reproduction.
+³ DSR1 vLLM+RIXL cross-validation: vLLM crashes at startup with `ibv_reg_mr ... access=0xf failed: Invalid argument` → `NIXL_ERR_BACKEND`. **Initial "ionic per-MR size ceiling" diagnosis is RETRACTED.** Eleven standalone probes on the same image/node/env disprove every infrastructure-layer hypothesis: ionic DRAM MR up to 4 GiB OK, ROCm/VRAM MR up to 8 GiB OK, 32×2 GiB concurrent in one process (64 GiB) OK, 8 procs × 2.58 GiB libibverbs OK, `access=0xf` (REMOTE_ATOMIC included) OK on ionic, NIXL+PyTorch 1×2.638 GiB OK, NIXL+PyTorch 16×1 GiB OK, `UCX_RCACHE_MAX_UNRELEASED=4` OK, 8 procs × 1×2.638 GiB NIXL+PyTorch (matches vLLM TP=8 exactly) OK, 8 procs × 60 regions × 256 MiB (120 GiB total) OK, 80 GiB pre-allocated weights then 2.638 GiB NIXL register OK. **Whatever causes vLLM to fail is vLLM-internal — not ionic, not MR limits, not UCX/RIXL/NIXL, not PyTorch, not multiprocessing, not memory pressure.** The right next step is direct instrumentation inside vLLM's `worker.py:929` (`register_memory` call site), not another transport-layer probe. Full elimination matrix in [`docs/12-dsr1-vllm-rixl-cross-validation.md`](docs/12-dsr1-vllm-rixl-cross-validation.md). All eight reproducer probes in [`scripts/probes/`](scripts/probes/).
 
 The remaining gap to the fork's headline 1,334 tok/s/GPU DEP8 result requires building MoRI from source, applying EP/DP-Attention, and a few additional patches — see [Path to Production Performance](docs/08-phase34-escalation-results.md#path-to-production-performance) in the escalation doc for the full 13-item list.
 
@@ -120,7 +128,7 @@ amd-mi355x-poc/
 │   ├── 10-dsr1-sweep-results.csv          ← raw per-c CSV from the DSR1 sweep
 │   ├── 11-m25-vllm-rixl-sweep.md          ← M2.5 sweep, RIXL has no transport ceiling
 │   ├── 11-m25-sweep-results.csv           ← raw per-c CSV from the M2.5 sweep
-│   └── 12-dsr1-vllm-rixl-cross-validation.md  ← DSR1+RIXL hits ionic MR-size limit at startup
+│   └── 12-dsr1-vllm-rixl-cross-validation.md  ← DSR1+RIXL crash root-cause investigation (11-hypothesis elimination matrix)
 ├── scripts/                               ← reproducer scripts (run from AAC1 login node)
 │   ├── phase1_e2e.sh                      ← SGLang+DSR1 single-node + bench
 │   ├── phase2_e2e.sh                      ← vLLM+MiniMax-M2.5 single-node (eager)
@@ -138,7 +146,16 @@ amd-mi355x-poc/
 │   ├── phase4_bench.py                    ← Phase 4 single-c bench
 │   ├── m25_bench.py                       ← M2.5 single-c bench
 │   ├── m25_sweep.sh                       ← M2.5 concurrency sweep
-│   └── rixl_probe.py                      ← Direct RIXL register-memory probe (Phase 4 debug)
+│   ├── rixl_probe.py                      ← Direct RIXL register-memory probe (Phase 4 debug)
+│   └── probes/                            ← standalone probes for the DSR1 root-cause investigation
+│       ├── ionic_mr_probe.c               ← DRAM MR size sweep on ionic_0 (4 GiB OK)
+│       ├── ionic_rocm_mr_probe.c          ← ROCm/VRAM MR size sweep (8 GiB OK)
+│       ├── ionic_concurrent_probe.cpp     ← repeat-registration loop (32×2 GiB OK)
+│       ├── ionic_multiproc_probe.sh       ← N parallel libibverbs procs (8×2.58 GiB OK)
+│       ├── ionic_atomic_probe.cpp         ← access-flag combinations (0xf OK on ionic)
+│       ├── nixl_pytorch_probe.py          ← NIXL+PyTorch via RIXL (mimics vLLM call shape)
+│       ├── nixl_multiproc_probe.sh        ← N parallel NIXL+PyTorch procs (matches vLLM TP=8)
+│       └── nixl_after_weights_probe.py    ← weight-pressure + KV register order (post-load OK)
 ├── container/
 │   └── Dockerfile.rocm-vllm-rixl          ← extends rocm/vllm-dev:nightly w/ UCX-ROCm + RIXL
 └── patches/                               ← runtime patches applied inside containers
@@ -194,6 +211,13 @@ bash scripts/phase4_disagg.sh
 # Phase 4 — vLLM + RIXL with M2.5
 bash scripts/phase4_m25_disagg.sh
 ssh <prefill_node> bash /tmp/m25_sweep.sh    # c=1, 4, 8, 16, 32
+
+# Phase 4 — DSR1 cross-validation (currently fails at startup; see doc 12)
+bash scripts/phase4_dsr1_disagg.sh
+
+# Standalone root-cause probes (no vLLM model load; ~30 s each)
+ssh <prefill_node> bash scripts/probes/nixl_multiproc_probe.sh 8 2638 1
+ssh <prefill_node> python3 scripts/probes/nixl_after_weights_probe.py 80 2638
 ```
 
 ### Cluster-ops gotchas (learned the hard way)
