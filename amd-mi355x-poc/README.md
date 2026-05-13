@@ -11,14 +11,14 @@ new lives under this `amd-mi355x-poc/` subdirectory and is applied at runtime
 by the launch scripts. The objective was to identify the **minimum** set of
 changes upstream `ai-dynamo/dynamo:main` would need to support AMD MI355X.
 
-## Four findings to take away
+## Three findings to take away (plus one open question)
 
 1. **Single-node aggregated Dynamo on AMD requires essentially zero patches**
    to upstream `dynamo` source. PRs 1, 2 in the breakdown below are mergeable
    today.
 
 2. **vLLM + RIXL disaggregated serving is production-ready on AMD ionic
-   hardware for medium-KV models.** Saturates cleanly at the **compute**
+   hardware for the M2.5 class of model.** Saturates cleanly at the **compute**
    ceiling on M2.5 (730 tok/s aggregate at c=32, 320/320 success). PR 5
    captures the dynamo-side bits — also mergeable today.
 
@@ -29,14 +29,19 @@ changes upstream `ai-dynamo/dynamo:main` would need to support AMD MI355X.
    `transport retry counter exceeded` at c=32. The fork uses MoRI for c>16
    production benchmarks; that's the next workstream, not a PoC blocker.
 
-4. **Public RIXL also has a ceiling on DSR1-class models — at startup, not
-   under load.** Same RIXL+UCX-ROCm stack that runs M2.5 cleanly fails to
-   `ibv_reg_mr` DSR1's 1.7-2.6 GB per-rank KV pool against ionic
-   (~250 MB per-MR limit). The MR-chunking that Mooncake's fork-staging code
-   does (and that MoRI does properly) is what's missing from public RIXL.
-   See [`docs/12-dsr1-vllm-rixl-cross-validation.md`](docs/12-dsr1-vllm-rixl-cross-validation.md). This sharpens the upstream story:
-   PR 5 is correct and mergeable today, but **the right scope-statement for
-   public RIXL on ionic is "medium-KV per rank"**, not "all models".
+**Open question (not a finding):** vLLM+RIXL on **DSR1** (TP=8, ~2.5 GB
+per-rank registration) crashes at startup with `NIXL_ERR_BACKEND` from a
+failed `ibv_reg_mr` call against ionic. We initially diagnosed this as an
+"ionic per-MR size ceiling" but **standalone libibverbs+HIP probes on the
+same node refute that** — ionic accepts up to 8 GiB ROCm/VRAM MRs, accepts
+`access=0xf` (REMOTE_ATOMIC included), and accepts 8 parallel processes each
+holding a 2.58 GiB MR. The actual failure mode is more specific (likely an
+interaction between PyTorch's VRAM allocator and UCX's multi-MD registration
+across 9 ionic devices) and needs further investigation. See
+[`docs/12-dsr1-vllm-rixl-cross-validation.md`](docs/12-dsr1-vllm-rixl-cross-validation.md).
+The honest scope-statement for PR 5: **validated production-ready on M2.5
+class, DSR1 needs follow-up — without overclaiming a root cause we have not
+yet pinned down.**
 
 ## Results — all milestones PASS
 
@@ -51,7 +56,7 @@ Hardware: 2× 8-GPU MI355X nodes, each with 9× AMD Pensando ionic RoCE NICs.
 | 2.5 | vLLM | single-node agg, TP=4 + HIP graphs | MiniMax-M2.5 FP8 (229B MoE) | **521** @ c=8 | compute | 24/24 |
 | 3 | SGLang | 2-node disagg + Mooncake, TP=8 each | DeepSeek-R1-0528 FP8 (671B) | **527** @ c=16 ¹ | **transport (Mooncake @ c=32)** | 160/160 |
 | 4 | vLLM | 2-node disagg + RIXL/UCX, TP=4 each | MiniMaxAI/MiniMax-M2.5 (229B MoE) | **730** @ c=32 ² | compute | 320/320 |
-| 4-DSR1 | vLLM | 2-node disagg + RIXL/UCX, TP=8 each | DeepSeek-R1-0528 FP8 (671B) | n/a — startup fails | **MR-size limit (ionic)** ³ | n/a |
+| 4-DSR1 | vLLM | 2-node disagg + RIXL/UCX, TP=8 each | DeepSeek-R1-0528 FP8 (671B) | n/a — startup fails | **`ibv_reg_mr` EINVAL — root cause not yet pinned** ³ | n/a |
 
 ### Side-by-side: same hardware, different transport
 
@@ -79,7 +84,7 @@ This is the architectural difference at the heart of finding #3. **RIXL's UCX-pl
 
 ² M2.5 vLLM+RIXL disagg headline: **730.4 tok/s @ c=32 with 320/320 success**. Performance saturates at compute (c=8/16/32 all hit ~720-730 tok/s aggregate; TTFT grows from 131ms to 33.6s but throughput plateaus). To go higher requires more decode GPUs or a smaller model. Detailed sweep + RIXL-vs-Mooncake architectural analysis in [`docs/11-m25-vllm-rixl-sweep.md`](docs/11-m25-vllm-rixl-sweep.md).
 
-³ DSR1 vLLM+RIXL cross-validation: same RIXL+UCX-ROCm stack that runs M2.5 cleanly cannot complete `ibv_reg_mr` for DSR1's 1.7-2.6 GB per-rank KV-pool MR against ionic (~250 MB per-MR limit). Two attempts (max-num-seqs=32 and =4) both `NIXL_ERR_BACKEND` at startup. This is the fundamental MR-size ceiling for vanilla public RIXL on ionic — completes the architectural story: M2.5 fits, DSR1 doesn't, neither public transport handles DSR1 at production scale on this NIC. Full reproducer + log excerpts in [`docs/12-dsr1-vllm-rixl-cross-validation.md`](docs/12-dsr1-vllm-rixl-cross-validation.md).
+³ DSR1 vLLM+RIXL cross-validation: vLLM crashes at startup with `ibv_reg_mr ... access=0xf failed: Invalid argument` → `NIXL_ERR_BACKEND`. **Initial "ionic per-MR size ceiling" diagnosis is RETRACTED** — standalone libibverbs+HIP probes on the same node show ionic accepts 8 GiB single-process MRs, 32×2 GiB concurrent MRs in one process (64 GiB cumulative), 8-process parallel 2.58 GiB MRs each, and `access=0xf` flag combinations. The real root cause is more specific (likely PyTorch VRAM allocator × UCX multi-MD-on-9-ionic-devices interaction) and needs further investigation. Full probe results + corrected diagnosis in [`docs/12-dsr1-vllm-rixl-cross-validation.md`](docs/12-dsr1-vllm-rixl-cross-validation.md). All five probes are in [`scripts/probes/`](scripts/probes/) for reproduction.
 
 The remaining gap to the fork's headline 1,334 tok/s/GPU DEP8 result requires building MoRI from source, applying EP/DP-Attention, and a few additional patches — see [Path to Production Performance](docs/08-phase34-escalation-results.md#path-to-production-performance) in the escalation doc for the full 13-item list.
 
