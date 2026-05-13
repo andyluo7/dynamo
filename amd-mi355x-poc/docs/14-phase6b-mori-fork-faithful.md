@@ -128,9 +128,112 @@ ssh <prefill> "podman cp scripts/mori_fork_sweep.sh sglang-mori-prefill:/tmp/ \
 #    next time so SLURM preemption doesn't lose them).
 ```
 
+## Phase 6c — single-allocation sbatch retry
+
+To dodge SLURM preemption, `scripts/phase6c_mori_sbatch.sh` packages the
+entire bring-up + smoke + sweep into one sbatch job that holds both nodes
+for 8 hours. Results bind-mounted to `/shared/.../mori-bench-results/job-N/`
+so they survive any container exit.
+
+Two iterations:
+
+- **Job 81**: fork-faithful config booted both servers in 990s, smoke OK,
+  but `sglang.bench_serving` failed with `ModuleNotFoundError:
+  No module named 'sglang.benchmark.datasets'`. Root cause: namespace-package
+  collision — `sglang` resolves to `/sgl-workspace/sglang` (repo root,
+  no `datasets/`) instead of `/sgl-workspace/sglang/python/sglang`
+  (actual package). All seven sweep iterations failed with exit=1 in 30s.
+
+- **Job 82** (PYTHONPATH fix): export `PYTHONPATH=/sgl-workspace/sglang/python`
+  before invoking the bench. **c=1 SUCCEEDED** with the fork-faithful
+  config; c=4 onwards crashed with the same MoRI `ibverbs.cpp:168 syscall
+  failed with Connection timed out` → `unknown parameter type` → `SIGQUIT`
+  cascade we saw in Phase 6 round 3.
+
+## Phase 6c c=1 result (fork-faithful config, MoRI-IO PD disagg)
+
+| Metric | Value |
+|---|---:|
+| Output throughput | **58.3 tok/s** |
+| Input throughput | 58.9 tok/s |
+| Total throughput | 117.2 tok/s |
+| Median TTFT | 560 ms |
+| **Median TPOT** | **14.63 ms** |
+| P99 TTFT | 1781 ms |
+| P99 TPOT | 26.0 ms |
+| Median E2E latency | 14.6 s |
+
+vs prior runs:
+
+| Run | c=1 throughput | c=1 TPOT |
+|---|---:|---:|
+| Phase 6 round 3 (symmetric flags, no MTP, mem-frac 0.65) | 24.8 tok/s | 39.4 ms |
+| Phase 3 fork-aligned Mooncake (Test 12 reproduction, c=1) | 105.7 tok/s | 9.46 ms |
+| **Phase 6c (fork-faithful MoRI, asymmetric + MTP)** | **58.3 tok/s** | **14.63 ms** |
+| Fork's published Test 12 (Mooncake) | 97.7 tok/s | 7.11 ms |
+
+The asymmetric prefill/decode config + NEXTN MTP got us from 25 → 58 tok/s
+and from 39.4 → 14.63 ms TPOT. That is **2.4× higher throughput and
+2.7× lower TPOT** than Phase 6 round 3 just from following the fork's
+launch flags exactly. Still 60% of fork's published Test 12 number, but
+that gap is now small enough to plausibly be attributable to:
+
+- the FP8 KV cache scaling-factor warning (output is garbled `MMMMM...`
+  / `íííí...` — likely affecting the per-token compute path)
+- our MoRI not being the version the fork builds (image MoRI is dated
+  20260503 — different from fork's pinned `2d02c6a9`)
+- BF16 vs FP8 dispatch quantization tuning
+
+## c>=4 still fails with MoRI RDMA timeout
+
+Even with the full fork-faithful config (asymmetric flags, MTP, --privileged,
+--ulimit memlock=-1, all 8 uverbs + rdma_cm), the decode worker crashes at
+c=4 with the same error pattern observed in Phase 6 round 3:
+
+```
+[mori]ibverbs.cpp:168: syscall failed with Connection timed out
+RuntimeError: unknown parameter type
+[2026-05-13 23:19:54] SIGQUIT received.
+```
+
+So the `--privileged` and memlock=-1 settings, while needed for general
+RDMA hygiene, did NOT eliminate the c>=4 failure. Most likely remaining
+cause is **NIC-level RDMA flow control (PFC)** as MoRI's own error
+message advised in round 3. The fork's runbook is silent about PFC tuning
+which suggests their cluster has it configured at the NIC/switch level —
+not something we can change as a non-admin on AAC1.
+
+## Reproducer (sbatch)
+
+```bash
+# Submit a single job that holds both nodes for the entire bring-up + sweep:
+sbatch --nodelist=smci355-ccs-aus-g12-06,smci355-ccs-aus-g12-26 \
+       scripts/phase6c_mori_sbatch.sh
+
+# Results land in /shared/amdgpu/home/anluo/mori-bench-results/job-<N>/
+# - prefill.log, decode.log, router.log
+# - smoke.json (single chat completion)
+# - sweep.csv (per-c results)
+# - cN.log + cN.json for each concurrency
+```
+
 ## Status vs fork's published numbers
 
-Still **not measured**. The Phase 6 round 1-3 doc (doc 13) has the only
-numbers we have so far (c=1 = 24.8 tok/s, c=4 = 96.1 tok/s) and those were
-NOT with the fork-faithful config. Re-running the sweep with the
-fork-faithful config + bind-mounted results dir is the next step.
+| Concurrency | Fork (Mooncake Test 12) | **Phase 6c (MoRI fork-faithful)** | Phase 3 (Mooncake) |
+|---:|---:|---:|---:|
+| c=1 | 97.7 tok/s, TPOT 7.11 ms | **58.3 tok/s, TPOT 14.63 ms** | 105.7 tok/s, TPOT 9.46 ms |
+| c=4 | 178 tok/s | **failed (MoRI ibverbs timeout)** | 261.7 tok/s |
+| c=16 | 672 tok/s | not reached | 527.4 tok/s |
+| c=128 | 2196 tok/s | not reached | not reached (Mooncake crashed @ c=32) |
+
+Honest read: **at c=1, fork-faithful MoRI on our AAC1 setup runs at 60% of
+the fork's published Mooncake number and 75% of our own Phase 3 Mooncake
+result.** Mooncake is competitive with MoRI at c=1 — MoRI's advantage
+shows up at higher concurrency, which we cannot reach because of the
+RDMA timeout cascade. To go further we need either:
+
+1. PFC configured on AAC1's ionic NICs (cluster-admin operation).
+2. The fork's exact MoRI commit (`2d02c6a9`) built into the image — the
+   image we have ships a later snapshot which may have different defaults.
+3. The fork team's exact env (probably has tuning settings beyond what's
+   in the public env.sh).
