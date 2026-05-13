@@ -3,58 +3,92 @@
 End-to-end PoC demonstrating NVIDIA Dynamo running on AMD MI355X (gfx950) GPUs
 with both vLLM and SGLang backends, in single-node aggregated **and** 2-node
 disaggregated topologies. Exercises the full stack: `dynamo.frontend`,
-`dynamo.sglang`/`dynamo.vllm`, etcd, NATS, and KV-cache transfer over AMD
+`dynamo.sglang` / `dynamo.vllm`, etcd, NATS, and KV-cache transfer over AMD
 Pensando ionic RoCE NICs.
 
 **This branch does not modify any existing `dynamo` source files.** Everything
-lives under this `amd-mi355x-poc/` subdirectory and is applied at runtime by
-the launch scripts. The objective was to identify the **minimum** set of
+new lives under this `amd-mi355x-poc/` subdirectory and is applied at runtime
+by the launch scripts. The objective was to identify the **minimum** set of
 changes upstream `ai-dynamo/dynamo:main` would need to support AMD MI355X.
 
-## Results — all milestones PASS (incl. production-scale escalations)
+## Three findings to take away
+
+1. **Single-node aggregated Dynamo on AMD requires essentially zero patches**
+   to upstream `dynamo` source. PRs 1, 2 in the breakdown below are mergeable
+   today.
+
+2. **vLLM + RIXL disaggregated serving is production-ready on AMD ionic
+   hardware today.** Saturates cleanly at the **compute** ceiling (730 tok/s
+   aggregate at c=32, 320/320 success on M2.5). PR 5 captures the dynamo-side
+   bits — also mergeable today.
+
+3. **SGLang + Mooncake disaggregated has a transport ceiling at c=32 on
+   ionic.** Matches the JohnQinAMD fork's documented finding. We exceed the
+   fork's published Mooncake numbers at low concurrency (+8.2% @ c=1, +47% @
+   c=4) and reach 527 tok/s @ c=16, but Mooncake crashes with cascading
+   `transport retry counter exceeded` at c=32. The fork uses MoRI for c>16
+   production benchmarks; that's the next workstream, not a PoC blocker.
+
+## Results — all milestones PASS
 
 Cluster: AAC1 (`aac1.amd.com`), partition `256C8G1H_MI355X_Ubuntu22`.
 Hardware: 2× 8-GPU MI355X nodes, each with 9× AMD Pensando ionic RoCE NICs.
 
-| Phase | Backend | Mode | Model | Result | c=8 tok/s | Success @ c=8 |
-|---|---|---|---|---|---|---|
-| 1 | SGLang | single-node agg, TP=8 | DeepSeek-R1-0528 FP8 (671B) | ✅ | 708 | 24/24 |
-| 2 / 2.5 | vLLM | single-node agg, TP=4, HIP graphs | MiniMax-M2.5 FP8 (229B MoE) | ✅ | 521 | 24/24 |
-| 3 (Qwen) | SGLang | 2-node disagg + Mooncake, TP=1 | Qwen3-0.6B | ✅ | 122 | 24/24 |
-| 3 (DSR1, conservative) | SGLang | 2-node disagg + Mooncake, TP=8 + HIP graphs | DeepSeek-R1-0528 FP8 (671B) | ✅ | 32.8 | 24/24 |
-| 3 (DSR1, fork-aligned, c=1) | SGLang | 2-node disagg + Mooncake, TP=8 + fork's launch + env + `--ignore-eos` (Test 12 repro) | DeepSeek-R1-0528 FP8 (671B) | ✅ | 105.7 tok/s/req ² | 10/10 |
-| **3 (DSR1, fork-aligned, c=16 sweep)** | **SGLang** | **2-node disagg + Mooncake, TP=8 + Tier A concurrency sweep** | **DeepSeek-R1-0528 FP8 (671B)** | **✅** | **527.4 aggregate tok/s** ³ | **160/160** |
-| 4 (Qwen) | vLLM | 2-node disagg + RIXL/UCX, TP=1, eager | Qwen3-0.6B | ✅ | 646 | 24/24 |
-| 4 (M2.5, c=8) | vLLM | 2-node disagg + RIXL/UCX, TP=4 + HIP graphs | MiniMaxAI/MiniMax-M2.5 (229B MoE) | ✅ | 587.1 ¹ | 24/24 |
-| **4 (M2.5, c=32 sweep)** | **vLLM** | **2-node disagg + RIXL/UCX, TP=4 + concurrency sweep** | **MiniMaxAI/MiniMax-M2.5 (229B MoE)** | **✅** | **730.4 aggregate tok/s** ⁴ | **320/320** |
+### Best result per configuration
 
-¹ Initial M2.5 disagg run with `--enforce-eager` measured 72.7 tok/s @ c=8; re-running with HIP graphs enabled gave **8.1× speedup** to 587 tok/s. Notably **587 > 521 (Phase 2.5 single-node agg)** — disagg has 2 nodes' compute (8 GPUs vs 4) and the Dynamo frontend + KV-router overhead does not exceed the doubled compute.
+| # | Backend | Topology | Model | Best aggregate tok/s | Saturated at | Success |
+|---|---|---|---|---:|---:|---:|
+| 1 | SGLang | single-node agg, TP=8 + HIP graphs | DeepSeek-R1-0528 FP8 (671B) | **708** @ c=8 | compute | 24/24 |
+| 2.5 | vLLM | single-node agg, TP=4 + HIP graphs | MiniMax-M2.5 FP8 (229B MoE) | **521** @ c=8 | compute | 24/24 |
+| 3 | SGLang | 2-node disagg + Mooncake, TP=8 each | DeepSeek-R1-0528 FP8 (671B) | **527** @ c=16 ¹ | **transport (Mooncake @ c=32)** | 160/160 |
+| 4 | vLLM | 2-node disagg + RIXL/UCX, TP=4 each | MiniMaxAI/MiniMax-M2.5 (229B MoE) | **730** @ c=32 ² | compute | 320/320 |
 
-² Initial DSR1 disagg measurement was 32.8 tok/s aggregate @ c=8 with a conservative launch config. After applying the fork's exact launch flags (`--kv-cache-dtype fp8_e4m3 --attention-backend aiter` etc. from `scripts/benchmark/models.yaml` DSR1 entry) + 9 env vars from `env.sh` + a streaming bench harness with ISL=1024, OSL=1024, `--ignore-eos` (matching `bench.sh`), per-request output throughput rose to **105.7 tok/s — 8.2% above the JohnQinAMD fork's published Test 12 result of 97.7 tok/s on the same Mooncake transport**. See [`docs/09-test12-reproduction.md`](docs/09-test12-reproduction.md).
+### Side-by-side: same hardware, different transport
 
-³ Concurrency sweep at c=1, 4, 8, 16 on the fork-aligned DSR1 disagg setup. **Best aggregate: 527.4 tok/s @ c=16 with 160/160 success — 16× over the conservative 32.8 tok/s baseline**. At c=4 (261.7 tok/s aggregate) we are **+47% ahead of the fork's published 178 tok/s** at the same concurrency (despite their using MoRI + EP/DP-Attn vs our plain Mooncake + TP=8). At c=16 we are -22% behind their 672 tok/s number. Mooncake-on-ionic crashed at c=32 with `transport retry counter exceeded` cascading errors — this matches the fork's documented Mooncake ceiling, which is why their headline benchmarks switched to MoRI for c>16. Tier B (`--cuda-graph-bs 1-128`) did NOT close the TPOT gap (9.43 ms vs fork's 7.11 ms — likely aiter MoE preshuffle tuning). See [`docs/10-dsr1-concurrency-sweep.md`](docs/10-dsr1-concurrency-sweep.md).
+| Concurrency | SGLang+Mooncake (DSR1) | **vLLM+RIXL (M2.5)** |
+|---:|---:|---:|
+| 4 | 261.7 tok/s | 385.4 tok/s |
+| 8 | 456.7 | 718.2 |
+| 16 | 527.4 | 727.3 |
+| **32** | **CRASH** (transport retry exceeded) | **730.4 tok/s, 320/320 success** |
 
-⁴ Concurrency sweep at c=1, 4, 8, 16, 32 on M2.5 vLLM+RIXL disagg. **Best aggregate: 730.4 tok/s @ c=32 with 320/320 success**. **Critical finding: vLLM+RIXL on the same ionic hardware does NOT have Mooncake's c=32 transport-crash ceiling** — it saturates cleanly at the compute limit (c=8/16/32 all hit ~720-730 tok/s aggregate; TTFT grows but throughput plateaus). Per fork docs and confirmed by our data, RIXL's UCX-plugin C++ DRAM staging handles ionic's MR limits more gracefully than Mooncake's Python-level chunked transfer pattern. See [`docs/11-m25-vllm-rixl-sweep.md`](docs/11-m25-vllm-rixl-sweep.md).
+This is the architectural difference at the heart of finding #3. **RIXL's UCX-plugin C++ DRAM staging handles ionic's MR limits gracefully where Mooncake's Python-level chunked-transfer pattern saturates the firmware's QP-setup queue.**
 
-Production-scale escalation rows (bold) — see [`docs/08-phase34-escalation-results.md`](docs/08-phase34-escalation-results.md). Both the 671B DeepSeek-R1 SGLang disagg and 229B MiniMax-M2.5 vLLM disagg paths run end-to-end across two MI355X nodes with KV transfer over Pensando ionic RoCE.
+### vs JohnQinAMD fork's published numbers
 
-Per-GPU efficiency observations:
-- **DSR1 disagg = 2.1 tok/s/GPU @ c=8** on 16 GPUs with Mooncake (the chunked-MR DRAM-staging path is the bottleneck — fork reports MoRI gives ~5× more throughput on ionic than Mooncake)
-- **M2.5 disagg = 73.4 tok/s/GPU @ c=8** on 8 GPUs with RIXL/UCX — **matches the JohnQinAMD fork's published 73.9 tok/s/GPU result** for DSR1 InferenceX MoRI 1P1D at c=32
+| Comparison point | Fork | Us | Verdict |
+|---|---:|---:|---|
+| Mooncake DSR1 @ c=1 (Test 12) | 97.7 tok/s/req | **105.7** | **+8.2% ahead** with stock public Mooncake |
+| Mooncake DSR1 TPOT @ c=1 | 7.11 ms | 9.46 ms | -33% (residual aiter MoE preshuffle tuning) |
+| MoRI+EP/DP-Attn DSR1 @ c=4 | 178 tok/s | **261.7** (Mooncake!) | **+47% ahead** |
+| MoRI+EP/DP-Attn DSR1 @ c=16 | 672 tok/s | 527.4 (Mooncake) | -22% behind |
+| MoRI+EP/DP-Attn DSR1 @ c=128 | 2,196 | n/a (Mooncake crashed at c=32) | needs MoRI to compete |
+| DEP8 DSR1 @ c=1024 | 16,011 (1,334/GPU) | n/a | needs MoRI + EP/DP-Attn (Tier 3 in path-to-prod) |
+
+¹ DSR1 SGLang+Mooncake disagg headline: **527.4 tok/s @ c=16 with 160/160 success — 16× over the conservative 32.8 tok/s baseline measured before fork-aligned tuning**. Crashed at c=32 (transport retry exceeded). See [`docs/10-dsr1-concurrency-sweep.md`](docs/10-dsr1-concurrency-sweep.md). Initial M2.5 disagg run with `--enforce-eager` measured 72.7 tok/s @ c=8; HIP graphs gave 8.1× speedup to 587. Initial DSR1 disagg measurement was 32.8 tok/s aggregate @ c=8 with a conservative launch config; applying the fork's exact launch flags + 9 env vars + matching bench harness raised per-request output throughput to **105.7 tok/s — 8.2% above the fork's published Test 12 result of 97.7 tok/s on the same Mooncake transport**, see [`docs/09-test12-reproduction.md`](docs/09-test12-reproduction.md).
+
+² M2.5 vLLM+RIXL disagg headline: **730.4 tok/s @ c=32 with 320/320 success**. Performance saturates at compute (c=8/16/32 all hit ~720-730 tok/s aggregate; TTFT grows from 131ms to 33.6s but throughput plateaus). To go higher requires more decode GPUs or a smaller model. Detailed sweep + RIXL-vs-Mooncake architectural analysis in [`docs/11-m25-vllm-rixl-sweep.md`](docs/11-m25-vllm-rixl-sweep.md).
 
 The remaining gap to the fork's headline 1,334 tok/s/GPU DEP8 result requires building MoRI from source, applying EP/DP-Attention, and a few additional patches — see [Path to Production Performance](docs/08-phase34-escalation-results.md#path-to-production-performance) in the escalation doc for the full 13-item list.
 
-Headline: **single-node aggregated Dynamo on AMD requires essentially zero
-patches** to upstream `dynamo` source. Disaggregated serving needs ~150 LoC
-new (vLLM path) or ~1000 LoC new (SGLang+Mooncake path) — both reasonable
-upstream PR sizes.
+## Suggested upstream PR breakdown
+
+| PR | Scope | LoC | Status |
+|---|---|---|---|
+| 1 | `dynamo.nixl_connect.import nixl._api` lazy + `typing_extensions.Self` use + `dynamo.sglang.publisher.py` Engine import path fix | ~15 source | **Mergeable today** |
+| 2 | `examples/backends/{sglang,vllm}/launch/rocm/agg_rocm.sh` + AMD quickstart docs | ~150 | **Mergeable today** |
+| 3 | New `dynamo.sglang.transports.mooncake_rocm` submodule (renamed from JohnQinAMD fork's `mooncake_rocm_staging.py` + `rocm_dram_staging_common.py`); opt-in via `SGLANG_MOONCAKE_ROCM_STAGING=1` | ~1000 | Needs design discussion |
+| 4 | `container/Dockerfile.rocm-{sglang,vllm}` with libionic ABI fix + ionic device discovery | ~150 each | Small, mostly Docker |
+| 5 | `dynamo.vllm.{args,main}` bootstrap-host patches + LD_PRELOAD interposer C source + UCX_TLS env var docs + libionic-rdmav34 mount instructions | ~150 | **Mergeable today** — Phase 4 PASS proved this works on public UCX 1.19.x |
+
+PRs 1, 2, 5 are essentially free wins — small diffs, no source-code controversy, all proven to work end-to-end in this PoC. PR 3 is the bulk of the SGLang disagg work and would benefit from a quick design conversation about transport-adapter location before sending.
 
 ## Layout
 
 ```
 amd-mi355x-poc/
 ├── README.md                              ← this file
-├── docs/                                  ← phase-by-phase reports
+├── docs/                                  ← phase-by-phase reports (read in order)
 │   ├── 00-poc-plan.md                     ← original plan + scope decisions
 │   ├── 01-phase0-inventory.md             ← AAC1 hardware inventory + tooling
 │   ├── 02-phase1-sglang-agg.md            ← SGLang + DSR1 single-node ✅
@@ -62,24 +96,35 @@ amd-mi355x-poc/
 │   ├── 04-phase2-vllm-agg.md              ← vLLM + MiniMax-M2.5 single-node ✅
 │   ├── 05-phase3-sglang-disagg.md         ← SGLang + Mooncake 2-node ✅
 │   ├── 06-phase4-vllm-disagg.md           ← vLLM + RIXL/UCX 2-node ✅
-│   └── 07-phase5-final-report.md          ← consolidated final report + PR breakdown
+│   ├── 07-phase5-final-report.md          ← consolidated final report + PR breakdown
+│   ├── 08-phase34-escalation-results.md   ← DSR1 + M2.5 production-scale escalation
+│   ├── 09-test12-reproduction.md          ← reproducing fork's Test 12 (+8.2% vs fork)
+│   ├── 10-dsr1-concurrency-sweep.md       ← DSR1 sweep, hits Mooncake ionic ceiling
+│   ├── 10-dsr1-sweep-results.csv          ← raw per-c CSV from the DSR1 sweep
+│   ├── 11-m25-vllm-rixl-sweep.md          ← M2.5 sweep, RIXL has no transport ceiling
+│   └── 11-m25-sweep-results.csv           ← raw per-c CSV from the M2.5 sweep
 ├── scripts/                               ← reproducer scripts (run from AAC1 login node)
 │   ├── phase1_e2e.sh                      ← SGLang+DSR1 single-node + bench
 │   ├── phase2_e2e.sh                      ← vLLM+MiniMax-M2.5 single-node (eager)
 │   ├── phase2_perf.sh                     ← vLLM+MiniMax-M2.5 single-node (HIP graphs + bench)
-│   ├── phase3_disagg.sh                   ← SGLang 1P1D disagg with Mooncake (orchestrator)
-│   ├── phase3_bench.py                    ← Phase 3 concurrency sweep client
-│   ├── phase4_disagg.sh                   ← vLLM 1P1D disagg with RIXL (orchestrator)
-│   ├── phase4_bench.py                    ← Phase 4 concurrency sweep client
+│   ├── phase3_disagg.sh                   ← SGLang 1P1D Qwen3-0.6B disagg with Mooncake
+│   ├── phase3_dsr1_disagg.sh              ← SGLang 1P1D DSR1 disagg, conservative config
+│   ├── phase3_test12_repro.sh             ← SGLang 1P1D DSR1 disagg, fork-aligned config
+│   ├── phase3_bench.py                    ← Phase 3 single-c bench
+│   ├── dsr1_bench.py                      ← DSR1 single-c bench
+│   ├── test12_bench.py                    ← streaming bench matching fork's bench.sh
+│   ├── test12_sweep.sh                    ← DSR1 concurrency sweep (calls test12_bench.py)
+│   ├── phase4_disagg.sh                   ← vLLM 1P1D Qwen3-0.6B disagg with RIXL
+│   ├── phase4_m25_disagg.sh               ← vLLM 1P1D M2.5 disagg with RIXL + HIP graphs
+│   ├── phase4_bench.py                    ← Phase 4 single-c bench
+│   ├── m25_bench.py                       ← M2.5 single-c bench
+│   ├── m25_sweep.sh                       ← M2.5 concurrency sweep
 │   └── rixl_probe.py                      ← Direct RIXL register-memory probe (Phase 4 debug)
 ├── container/
 │   └── Dockerfile.rocm-vllm-rixl          ← extends rocm/vllm-dev:nightly w/ UCX-ROCm + RIXL
 └── patches/                               ← runtime patches applied inside containers
     ├── README.md                          ← describes each patch + upstream candidate
     ├── nixl_stub/                         ← 4-file Python stub (Phase 1/2/3)
-    │   ├── __init__.py
-    │   ├── _api.py
-    │   └── _bindings.py
     ├── ibv_ionic_compat.c                 ← LD_PRELOAD interposer for ionic (Phase 4)
     ├── zzz_typing_self_compat.pth         ← Python 3.10 compat shim (Phase 1/3/4)
     └── fork-patches/                      ← copied from JohnQinAMD/dynamo:amd-dynamo
@@ -95,62 +140,48 @@ amd-mi355x-poc/
 
 - Access to a cluster with 8× AMD Instinct MI355X (gfx950) per node
 - Pensando ionic RoCE NICs (or equivalent — KV-transfer specifics will differ)
-- `podman` (containers) — note: rocm/vllm-dev:nightly user is NOT in `docker` group
+- `podman` (containers) — note: rocm/vllm-dev:nightly user is NOT in `docker` group on AAC1
 - ROCm 7.2.x available (e.g., via `module load rocm/7.2.2` on AAC1)
-- `huggingface-cli` access to `deepseek-ai/DeepSeek-R1-0528`, `MiniMaxAI/MiniMax-M2.5`,
-  `Qwen/Qwen3-0.6B` (the latter two should be pre-cached on shared FS)
+- HuggingFace access to `deepseek-ai/DeepSeek-R1-0528`, `MiniMaxAI/MiniMax-M2.5`,
+  `Qwen/Qwen3-0.6B`
 
-### Phase 1 — SGLang single-node aggregated, DeepSeek-R1 FP8
+### Single-node aggregated
 
 ```bash
+# Phase 1 — SGLang + DSR1 (TP=8, HIP graphs, ~10 min model load)
 bash scripts/phase1_e2e.sh
-# Container `dynamo-sglang-poc` will load DSR1 (~10 min from NFS),
-# bring up dynamo.frontend on :8000, register the model, and run a
-# concurrency sweep at c=1, 4, 8.
+
+# Phase 2 — vLLM + MiniMax-M2.5 single-node
+bash scripts/phase2_e2e.sh    # eager (smoke test)
+bash scripts/phase2_perf.sh   # HIP graphs (production)
 ```
 
-### Phase 2 — vLLM single-node aggregated, MiniMax-M2.5
+### 2-node disaggregated
 
 ```bash
-# Smoke test (eager mode, ~5 min model load):
-bash scripts/phase2_e2e.sh
-
-# Production perf (HIP graphs, ~7 min model load + 2 min graph capture):
-bash scripts/phase2_perf.sh
-```
-
-### Phase 3 — SGLang 1P1D disaggregated with Mooncake
-
-```bash
-# Edit the script to set PREFILL_NODE/DECODE_NODE/PREFILL_IP for your cluster.
+# Phase 3 — SGLang + Mooncake (Qwen3-0.6B small model)
 bash scripts/phase3_disagg.sh
-# Bench:
-ssh <prefill_node> python3 /tmp/phase3_bench.py
-```
 
-### Phase 4 — vLLM 1P1D disaggregated with RIXL
+# Phase 3 — DSR1 with fork-aligned config (Test 12 reproduction)
+bash scripts/phase3_test12_repro.sh
+ssh <prefill_node> python3 /tmp/test12_bench.py --isl 1024 --osl 1024 --conc 16 --num-prompts 160 --warmup 32 --ignore-eos
+# Or run the full sweep:
+bash scripts/test12_sweep.sh    # c=1, 4, 8, 16, 32, 64
 
-```bash
-# First time: build the custom image (~10 min, includes UCX-ROCm + RIXL).
-podman build -t dynamo-vllm-rixl:latest -f container/Dockerfile.rocm-vllm-rixl .
-
-# Then orchestrate prefill+decode across two nodes:
+# Phase 4 — vLLM + RIXL (Qwen3-0.6B)
+podman build -t dynamo-vllm-rixl:latest -f container/Dockerfile.rocm-vllm-rixl .  # ~10 min, first time
 bash scripts/phase4_disagg.sh
-ssh <prefill_node> python3 /tmp/p4_bench.py
+
+# Phase 4 — vLLM + RIXL with M2.5
+bash scripts/phase4_m25_disagg.sh
+ssh <prefill_node> bash /tmp/m25_sweep.sh    # c=1, 4, 8, 16, 32
 ```
 
-## Suggested upstream PR breakdown (from `docs/07-phase5-final-report.md`)
+### Cluster-ops gotchas (learned the hard way)
 
-| PR | Scope | LoC | Risk |
-|---|---|---|---|
-| 1 | nixl import lazy + typing_extensions.Self use + dynamo.sglang.publisher Engine import fix | ~15 source | Tiny, mergeable today |
-| 2 | `examples/backends/{sglang,vllm}/launch/rocm/agg_rocm.sh` + AMD quickstart docs | ~150 | Tiny, mergeable today |
-| 3 | new `dynamo.sglang.transports.mooncake_rocm` submodule (renamed from fork's mooncake_rocm_staging.py + rocm_dram_staging_common.py) | ~1000 | Medium |
-| 4 | `container/Dockerfile.rocm-{sglang,vllm}` baking the libionic ABI fix + ionic device discovery | ~150 each | Small, mostly Docker |
-| 5 | `dynamo.vllm.{args,main}` bootstrap-host patches + LD_PRELOAD interposer C source + UCX_TLS env documentation | ~150 | **Mergeable today** — Phase 4 PASS proved this works on public UCX 1.19.x |
-
-PRs 1, 2, 5 are essentially free wins — small diffs, no source-code controversy,
-all proven to work end-to-end in this PoC.
+- The SLURM partition `256C8G1H_MI355X_Ubuntu22` on AAC1 is **NOT enforced exclusive**. Multiple users can land on the same node. Pick an explicit idle node via `--nodelist=` in your sbatch and verify with `rocm-smi --showmemuse` before launching.
+- ROCm/HIP doesn't always release GPU memory immediately on container kill. Use `pkill -9 -f VLLM::Worker` / `pkill -9 -f sglang.srt` to force-release if `podman rm -f` leaves orphans.
+- The dynamo-prefill container's `--log-level warning` suppresses progress lines for HIP graph capture and KV transfer — looks "stuck" for the first ~10 min after launch but is fine. Check `rocm-smi --showpids` if uncertain.
 
 ## License + attribution
 
