@@ -230,10 +230,77 @@ Honest read: **at c=1, fork-faithful MoRI on our AAC1 setup runs at 60% of
 the fork's published Mooncake number and 75% of our own Phase 3 Mooncake
 result.** Mooncake is competitive with MoRI at c=1 — MoRI's advantage
 shows up at higher concurrency, which we cannot reach because of the
-RDMA timeout cascade. To go further we need either:
+RDMA timeout cascade.
 
-1. PFC configured on AAC1's ionic NICs (cluster-admin operation).
-2. The fork's exact MoRI commit (`2d02c6a9`) built into the image — the
-   image we have ships a later snapshot which may have different defaults.
-3. The fork team's exact env (probably has tuning settings beyond what's
-   in the public env.sh).
+## ROOT CAUSE — AAC1 ionic uses ECN/DCQCN, NOT PFC
+
+After the c=1 / c≥4 split surfaced, we read the ionic NIC sysfs counters
+on `smci355-ccs-aus-g12-06` directly. The numbers are decisive:
+
+| Counter | Value | Meaning |
+|---|---:|---|
+| `rx_rdma_ecn_pkts` | **924,933,861** | Senders told to slow down 925M times via ECN marks |
+| `rx_rdma_cnp_pkts` | 17,954,708 | DCQCN Congestion Notification Packets sent |
+| `rdma_puec_cc_cwnd_dec` | 798,930,482 | Congestion-control window decreases |
+| `rdma_puec_cc_cwnd_inc` | 5,742,505 | Window increases (139× fewer than decreases) |
+| `rdma_retx_rto` | 16,218 | RDMA retransmission timeouts |
+| `tx_rdma_ack_timeout` | 16,218 | Matching ACK timeouts |
+| `resp_rx_dup_request` | 15,077,283 | Duplicate requests received (from retransmissions) |
+| `req_rx_dup_response` | 410,349 | Duplicate responses received |
+
+The presence of `rx_rdma_ecn_pkts` (and the absence of any PFC pause
+counters) confirms AAC1's ionic NICs run **lossy RoCEv2 with ECN/DCQCN
+congestion control, not lossless PFC**. Senders ARE backing off via
+DCQCN — but the back-off rate (798M decreases vs 5.7M increases =
+constant throttle pressure) and the 16K retransmission timeouts mean
+this is not a tightly-tuned lossless fabric; it is a multi-tenant
+cluster where RDMA is best-effort.
+
+**This is exactly the wrong environment for MoRI.** MoRI is designed for
+clusters with lossless PFC where it can push bulk RDMA without backoff.
+On a lossy ECN cluster, MoRI's bulk RDMA hits the timeout wall the
+moment concurrency rises above c=1.
+
+**This is the right environment for Mooncake.** Mooncake's chunked
+register → transfer → deregister pattern naturally back-pressures against
+ECN/DCQCN — every chunk is independent, the application sees per-chunk
+backpressure, and the firmware's QP-setup queue gets time to recover
+between bursts. That is why Phase 3 SGLang+Mooncake reached **527 tok/s
+@ c=16 with 160/160 success on this same NIC** while Phase 6c MoRI
+fails at c=4.
+
+## Architectural finding for the AMD ↔ NVIDIA conversation
+
+The right disagg KV transport on a given AMD ionic cluster depends on
+whether PFC is configured at the NIC and switch fabric:
+
+| Cluster fabric | Best transport | Reason |
+|---|---|---|
+| Lossless PFC (e.g. JohnQinAMD's bench cluster) | **MoRI** | Bulk RDMA, no backoff needed; gets the 178/672/2196 tok/s @ c=4/16/128 numbers |
+| Lossy ECN/DCQCN (e.g. AAC1) | **Mooncake** | Chunked transfer cooperates with sender-rate backoff; reaches c=16 cleanly |
+
+This is **not** a "MoRI is better than Mooncake" or vice-versa story.
+It is "the network fabric determines the transport." Our PoC validates
+both transports work on the same Dynamo + SGLang + AMD MI355X stack;
+the fork's published numbers and ours are both correct, just measured
+on different fabrics.
+
+## Path forward (not a current workstream)
+
+To reach the fork's MoRI numbers on AAC1 specifically, you need one of:
+
+1. **PFC enabled on the ionic NIC + switch ports for the QoS class
+   MoRI uses** (TC=96 in our config). This is a cluster-admin operation
+   spanning NIC drivers, switch ACLs, and possibly DCB configuration.
+2. **Move benchmarks to a PFC-configured cluster** (the fork's own
+   bench cluster, or any reservation that has lossless RoCEv2 set up).
+3. **Patch MoRI to tolerate lossy RDMA** by enabling its retry path,
+   reducing in-flight WR count, and making timeouts longer. This is a
+   MoRI source change (in `src/application/transport/rdma/providers/ibverbs/`)
+   that should be a github issue at `ROCm/MoRI`, not something to land
+   in this PoC.
+
+For our PoC, the **correct conclusion is to ship the Mooncake numbers
+as the primary disagg result for AAC1 and document the MoRI c=1 datapoint
+as evidence that the integration works** — the c≥4 ceiling is fabric,
+not software.
