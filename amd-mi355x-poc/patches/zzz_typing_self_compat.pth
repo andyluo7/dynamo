@@ -1,1 +1,0 @@
-import typing, typing_extensions; (not hasattr(typing, "Self")) and setattr(typing, "Self", typing_extensions.Self)
