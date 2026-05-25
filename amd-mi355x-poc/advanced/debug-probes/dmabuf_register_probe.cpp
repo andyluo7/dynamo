@@ -9,19 +9,47 @@
 // we're proposing to add to Mooncake (parallel to the existing CUDA path
 // at rdma_context.cpp:311) will work in your environment.
 //
-// Build:
-//   g++ -std=c++17 -O2 dmabuf_register_probe.cpp \
-//     -I/opt/rocm/include -L/opt/rocm/lib \
-//     -lhsa-runtime64 -lamdhip64 -libverbs \
+// Build (prefer hipcc — it sets the HIP platform macros for you):
+//   hipcc -std=c++17 -O2 dmabuf_register_probe.cpp \
+//     -L/opt/rocm/lib -lhsa-runtime64 -libverbs \
 //     -o dmabuf_register_probe
+//
+// Plain g++ also works if you define __HIP_PLATFORM_AMD__ and include
+// /opt/rocm/include.
 //
 // Run:
 //   ./dmabuf_register_probe              # auto-pick first RDMA device
-//   ./dmabuf_register_probe rocep28s0    # specific device
+//   ./dmabuf_register_probe ionic_0      # specific device
 //
 // Exit codes:
 //   0 = PASS, dmabuf path works
 //   1 = FAIL with diagnostic on stderr
+//
+// Container recipe for AAC1 (Pensando ionic NICs need host vendor libs):
+//   DEVS=$(ls /dev/infiniband/uverbs* | xargs -n1 -I{} echo --device {} | xargs)
+//   podman run --rm --device /dev/kfd --device /dev/dri $DEVS \
+//     --group-add keep-groups --cap-add IPC_LOCK --ipc host --network host \
+//     -v /sys/class/infiniband:/sys/class/infiniband:ro \
+//     -v /sys/devices:/sys/devices:ro \
+//     -v /etc/libibverbs.d:/etc/libibverbs.d:ro \
+//     -v /usr/lib/x86_64-linux-gnu/libionic.so:/usr/lib/x86_64-linux-gnu/libionic.so:ro \
+//     -v /usr/lib/x86_64-linux-gnu/libionic.so.1:/usr/lib/x86_64-linux-gnu/libionic.so.1:ro \
+//     -v $(readlink -f /usr/lib/x86_64-linux-gnu/libionic.so.1):$(readlink -f /usr/lib/x86_64-linux-gnu/libionic.so.1):ro \
+//     -v /usr/lib/x86_64-linux-gnu/libibverbs/libionic-rdmav34.so:/usr/lib/x86_64-linux-gnu/libibverbs/libionic-rdmav34.so:ro \
+//     -v $(pwd)/dmabuf_register_probe.cpp:/tmp/probe.cpp:ro \
+//     docker.io/rocm/atom-dev:vllm-v0.19.0-nightly_20260512 bash -c '
+//       cd /tmp && hipcc -std=c++17 -O2 probe.cpp -lhsa-runtime64 -libverbs -o probe
+//       ./probe ionic_0
+//     '
+//
+// On Hotaisle (Broadcom bnxt_re — host already has all libs):
+//   hipcc -std=c++17 -O2 dmabuf_register_probe.cpp -lhsa-runtime64 -libverbs -o probe
+//   ./probe rocep28s0
+//
+// Validated PASS:
+//   - AAC1 MI355X (gfx950) + Pensando ionic + ROCm 7.2.2
+//   - Hotaisle MI300X (gfx942) + Broadcom Thor2 (bnxt_re) + ROCm 7.0.2
+//     + Ubuntu 5.15.0-173 kernel + amdgpu DKMS 6.14.14
 
 #include <cerrno>
 #include <cstdio>
