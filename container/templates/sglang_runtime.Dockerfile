@@ -35,18 +35,26 @@ RUN userdel -r ubuntu > /dev/null 2>&1 || true \
     # NOTE: Setting ENV UMASK=002 does NOT work - umask is a shell builtin, not an environment variable
     && mkdir -p /etc/profile.d && echo 'umask 002' > /etc/profile.d/00-umask.sh
 
-{% if device == "xpu" %}
-{# XPU runtime: NIXL + UCX are needed for P2P transport on Intel GPUs.
+{% if device == "xpu" or device == "rocm" %}
+{# XPU/ROCm runtime: NIXL + UCX are needed for P2P transport on non-CUDA GPUs.
    CUDA sglang runtime does NOT include NIXL/UCX (matching upstream main);
    those are only added in the dev stage for build-time linking. #}
+{% if device == "xpu" %}
 ENV NIXL_PREFIX=/opt/intel/intel_nixl
+{% else %}
+ENV NIXL_PREFIX=/opt/amd/amd_nixl
+{% endif %}
 ENV NIXL_LIB_DIR=$NIXL_PREFIX/lib/x86_64-linux-gnu
 ENV NIXL_PLUGIN_DIR=$NIXL_LIB_DIR/plugins
 
 # Copy UCX and NIXL from wheel_builder
 COPY --from=wheel_builder /usr/local/ucx /usr/local/ucx
 COPY --chown=dynamo:0 --from=wheel_builder $NIXL_PREFIX $NIXL_PREFIX
+{% if device == "xpu" %}
 COPY --chown=dynamo:0 --from=wheel_builder /opt/intel/intel_nixl/lib/x86_64-linux-gnu/. ${NIXL_LIB_DIR}/
+{% else %}
+COPY --chown=dynamo:0 --from=wheel_builder /opt/amd/amd_nixl/lib/x86_64-linux-gnu/. ${NIXL_LIB_DIR}/
+{% endif %}
 
 COPY --chown=dynamo:0 --from=wheel_builder /opt/dynamo/dist/nixl/ /opt/dynamo/wheelhouse/nixl/
 COPY --chown=dynamo:0 --from=wheel_builder /workspace/nixl/build/src/bindings/python/nixl-meta/nixl-*.whl /opt/dynamo/wheelhouse/nixl/
@@ -99,6 +107,16 @@ RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
     pip install --break-system-packages --no-deps \
         /opt/dynamo/wheelhouse/ai_dynamo_runtime*.whl \
         /opt/dynamo/wheelhouse/ai_dynamo*any.whl
+
+{% if device == "rocm" %}
+# ROCm builds NIXL from source in wheel_builder (the upstream lmsysorg/sglang
+# ROCm image ships no NIXL), so install that wheel here for the disaggregated
+# KV transport. LD_LIBRARY_PATH above points at the matching native libs.
+RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
+    export PIP_CACHE_DIR=/root/.cache/pip && \
+    pip install --break-system-packages --no-deps \
+        /opt/dynamo/wheelhouse/nixl/nixl*.whl
+{% endif %}
 
 # Install accelerate for diffusion/video worker pipelines (diffusers requires it
 # for enable_model_cpu_offload but the upstream SGLang runtime image omits it)
@@ -182,6 +200,10 @@ RUN chmod 755 /opt/dynamo/.launch_screen && \
     echo 'source /opt/intel/oneapi/setvars.sh --force' >> /etc/bash.bashrc && \
     mkdir -p /sgl-workspace && \
     ln -sf /workspace /sgl-workspace/dynamo
+{%- elif device == "rocm" %}
+{# No nsys on ROCm; mkdir -p because the ROCm sglang base may not ship /sgl-workspace. #}
+    mkdir -p /sgl-workspace && \
+    ln -sf /workspace /sgl-workspace/dynamo
 {%- else %}
     ln -s /workspace /sgl-workspace/dynamo && \
     NSYS_BIN=$(find /opt/nvidia/nsight-compute -maxdepth 6 -type f -name nsys -executable 2>/dev/null | head -n1) && \
@@ -207,6 +229,9 @@ ENV DYNAMO_COMMIT_SHA=${DYNAMO_COMMIT_SHA}
 
 {% if device == "xpu" %}
 CMD ["bash", "-c", "source /etc/bash.bashrc && exec bash"]
+{% elif device == "rocm" %}
+{# The ROCm sglang base ships no nvidia_entrypoint.sh. #}
+CMD ["bash", "-c", "source /etc/bash.bashrc && exec bash"]
 {% else %}
 ENTRYPOINT ["/opt/nvidia/nvidia_entrypoint.sh"]
 CMD []
@@ -230,6 +255,11 @@ FROM pre_runtime AS runtime
 {% if target not in ("dev", "local-dev") %}
 COPY --from=licenses /legal /legal
 {% endif %}
+{% if device == "rocm" %}
+{# The ROCm sglang base ships no nvidia_entrypoint.sh. #}
+CMD ["bash", "-c", "source /etc/bash.bashrc && exec bash"]
+{% else %}
 ENTRYPOINT ["/opt/nvidia/nvidia_entrypoint.sh"]
 CMD []
+{% endif %}
 {% endif %}
